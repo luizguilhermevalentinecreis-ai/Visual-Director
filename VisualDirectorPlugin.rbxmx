@@ -14,7 +14,7 @@ local ServerStorage = game:GetService("ServerStorage")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 
 local PLUGIN_VERSION = "0.1.0"
-local DEFAULT_RELAY = "http://127.0.0.1:34729"
+local DEFAULT_RELAY = "https://visual-director-relay.onrender.com"
 local SETTINGS = {
     relay = "VisualDirectorRelayUrlV1",
     installation = "VisualDirectorInstallationIdV1",
