@@ -1,0 +1,9 @@
+{
+  "name": "RobloxVisualDirectorPlugin",
+  "tree": {
+    "$className": "Folder",
+    "VisualDirectorPlugin": {
+      "$path": "studio-plugin/VisualDirectorPlugin.server.lua"
+    }
+  }
+}

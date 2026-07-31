@@ -1,0 +1,656 @@
+local HttpService = game:GetService("HttpService")
+local Selection = game:GetService("Selection")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+
+local PLUGIN_VERSION = "0.1.0"
+local DEFAULT_RELAY = "http://127.0.0.1:34729"
+local SETTINGS = {
+    relay = "VisualDirectorRelayUrlV1",
+    installation = "VisualDirectorInstallationIdV1",
+    pairing = "VisualDirectorPairingCodeV1",
+}
+
+local function ensureSetting(key, factory)
+    local value = plugin:GetSetting(key)
+    if type(value) ~= "string" or value == "" then
+        value = factory()
+        plugin:SetSetting(key, value)
+    end
+    return value
+end
+
+local function generatePairingCode()
+    local raw = string.upper(string.gsub(HttpService:GenerateGUID(false), "[^%w]", ""))
+    return string.sub(raw, 1, 5) .. "-" .. string.sub(raw, 6, 10)
+end
+
+local installationId = ensureSetting(SETTINGS.installation, function() return HttpService:GenerateGUID(false) end)
+local pairingCode = ensureSetting(SETTINGS.pairing, generatePairingCode)
+local relayUrl = plugin:GetSetting(SETTINGS.relay)
+if type(relayUrl) ~= "string" or relayUrl == "" then relayUrl = DEFAULT_RELAY end
+local launchId = HttpService:GenerateGUID(false)
+local token = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
+local sessionId = nil
+local connected = false
+local running = true
+
+local toolbar = plugin:CreateToolbar("Visual Director")
+local openButton = toolbar:CreateButton("Visual Director", "AI VFX, impact frames and HUD authoring", "rbxassetid://14978048121")
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 390, 460, 300, 320)
+local widget = plugin:CreateDockWidgetPluginGui("VisualDirectorDock_v1", widgetInfo)
+widget.Title = "Visual Director v" .. PLUGIN_VERSION
+
+local root = Instance.new("Frame")
+root.Size = UDim2.fromScale(1, 1)
+root.BackgroundColor3 = Color3.fromRGB(19, 20, 25)
+root.BorderSizePixel = 0
+root.Parent = widget
+
+local padding = Instance.new("UIPadding")
+padding.PaddingTop = UDim.new(0, 14)
+padding.PaddingBottom = UDim.new(0, 14)
+padding.PaddingLeft = UDim.new(0, 14)
+padding.PaddingRight = UDim.new(0, 14)
+padding.Parent = root
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 9)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = root
+
+local function label(text, height, color)
+    local item = Instance.new("TextLabel")
+    item.Size = UDim2.new(1, 0, 0, height or 22)
+    item.BackgroundTransparency = 1
+    item.Text = text
+    item.TextColor3 = color or Color3.fromRGB(225, 228, 236)
+    item.TextXAlignment = Enum.TextXAlignment.Left
+    item.TextWrapped = true
+    item.Font = Enum.Font.Gotham
+    item.TextSize = 13
+    item.Parent = root
+    return item
+end
+
+local title = label("AI VFX authoring bridge", 28, Color3.fromRGB(255, 255, 255))
+title.Font = Enum.Font.GothamBold
+title.TextSize = 17
+label("Crie VFX 3D/2D, impact frames e HUDs por drafts declarativos seguros.", 38, Color3.fromRGB(164, 170, 187))
+
+local relayBox = Instance.new("TextBox")
+relayBox.Size = UDim2.new(1, 0, 0, 38)
+relayBox.BackgroundColor3 = Color3.fromRGB(31, 33, 41)
+relayBox.BorderSizePixel = 0
+relayBox.ClearTextOnFocus = false
+relayBox.Text = relayUrl
+relayBox.PlaceholderText = "https://seu-relay.onrender.com"
+relayBox.TextColor3 = Color3.fromRGB(232, 235, 244)
+relayBox.TextXAlignment = Enum.TextXAlignment.Left
+relayBox.Font = Enum.Font.Code
+relayBox.TextSize = 12
+relayBox.Parent = root
+Instance.new("UICorner", relayBox).CornerRadius = UDim.new(0, 7)
+
+local codeLabel = label("Código permanente deste usuário do Studio:", 20, Color3.fromRGB(164, 170, 187))
+local codeBox = Instance.new("TextBox")
+codeBox.Size = UDim2.new(1, 0, 0, 46)
+codeBox.BackgroundColor3 = Color3.fromRGB(28, 46, 49)
+codeBox.BorderSizePixel = 0
+codeBox.ClearTextOnFocus = false
+codeBox.TextEditable = false
+codeBox.Text = pairingCode
+codeBox.TextColor3 = Color3.fromRGB(113, 244, 219)
+codeBox.Font = Enum.Font.Code
+codeBox.TextSize = 22
+codeBox.Parent = root
+Instance.new("UICorner", codeBox).CornerRadius = UDim.new(0, 7)
+
+local statusLabel = label("Desconectado", 28, Color3.fromRGB(244, 150, 113))
+statusLabel.Font = Enum.Font.GothamMedium
+
+local connectButton = Instance.new("TextButton")
+connectButton.Size = UDim2.new(1, 0, 0, 40)
+connectButton.BackgroundColor3 = Color3.fromRGB(91, 92, 230)
+connectButton.BorderSizePixel = 0
+connectButton.Text = "Conectar"
+connectButton.TextColor3 = Color3.new(1, 1, 1)
+connectButton.Font = Enum.Font.GothamBold
+connectButton.TextSize = 14
+connectButton.Parent = root
+Instance.new("UICorner", connectButton).CornerRadius = UDim.new(0, 7)
+
+label("O código não muda após requisições. Clique no campo para selecionar e copiar. HTTP Requests precisam estar habilitados no Studio.", 58, Color3.fromRGB(132, 138, 154))
+
+local function setStatus(text, ok)
+    statusLabel.Text = text
+    statusLabel.TextColor3 = ok and Color3.fromRGB(113, 244, 166) or Color3.fromRGB(244, 150, 113)
+end
+
+openButton.Click:Connect(function() widget.Enabled = not widget.Enabled end)
+codeBox.Focused:Connect(function()
+    task.defer(function()
+        codeBox.CursorPosition = 1
+        codeBox.SelectionStart = #codeBox.Text + 1
+    end)
+end)
+
+local function trimUrl(value)
+    value = string.gsub(value, "%s+", "")
+    return string.gsub(value, "/+$", "")
+end
+
+local function request(method, path, body)
+    local response = HttpService:RequestAsync({
+        Url = relayUrl .. path,
+        Method = method,
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body and HttpService:JSONEncode(body) or nil,
+    })
+    if not response.Success then error("HTTP " .. tostring(response.StatusCode) .. ": " .. tostring(response.Body)) end
+    return response.Body ~= "" and HttpService:JSONDecode(response.Body) or {}
+end
+
+local function color(value, fallback)
+    if type(value) ~= "table" then return fallback or Color3.new(1, 1, 1) end
+    return Color3.new(math.clamp(value.r or 1, 0, 1), math.clamp(value.g or 1, 0, 1), math.clamp(value.b or 1, 0, 1))
+end
+
+local function vector3(value, fallback)
+    if type(value) ~= "table" then return fallback or Vector3.zero end
+    return Vector3.new(value.x or 0, value.y or 0, value.z or 0)
+end
+
+local function sequenceColor(stops)
+    local keys = {}
+    for _, stop in ipairs(stops or {}) do table.insert(keys, ColorSequenceKeypoint.new(stop.time or 0, color(stop.color))) end
+    if #keys == 0 then keys = { ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)), ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)) }
+    if keys[1].Time ~= 0 then table.insert(keys, 1, ColorSequenceKeypoint.new(0, keys[1].Value)) end
+    if keys[#keys].Time ~= 1 then table.insert(keys, ColorSequenceKeypoint.new(1, keys[#keys].Value)) end
+    return ColorSequence.new(keys)
+end
+
+local function sequenceNumber(stops, fallback)
+    local keys = {}
+    for _, stop in ipairs(stops or {}) do table.insert(keys, NumberSequenceKeypoint.new(stop.time or 0, stop.value or fallback or 0)) end
+    if #keys == 0 then keys = { NumberSequenceKeypoint.new(0, fallback or 0), NumberSequenceKeypoint.new(1, fallback or 0) } end
+    if keys[1].Time ~= 0 then table.insert(keys, 1, NumberSequenceKeypoint.new(0, keys[1].Value)) end
+    if keys[#keys].Time ~= 1 then table.insert(keys, NumberSequenceKeypoint.new(1, keys[#keys].Value)) end
+    return NumberSequence.new(keys)
+end
+
+local function numberRange(value, fallback)
+    if type(value) ~= "table" then return NumberRange.new(fallback or 0) end
+    return NumberRange.new(value.min or fallback or 0, value.max or fallback or 0)
+end
+
+local function setCommon(instance, node)
+    instance.Name = node.name or node.id or node.kind
+    instance:SetAttribute("VisualDirectorNodeId", node.id)
+    instance:SetAttribute("VisualDirectorKind", node.kind)
+    instance:SetAttribute("StartTime", node.startTime or 0)
+    instance:SetAttribute("EndTime", node.endTime or 0)
+    instance:SetAttribute("EnabledByDraft", node.enabled ~= false)
+end
+
+local function anchorPart(name, position, rotation)
+    local part = Instance.new("Part")
+    part.Name = name
+    part.Size = Vector3.new(0.1, 0.1, 0.1)
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.Transparency = 1
+    local pos = vector3(position)
+    local rot = vector3(rotation)
+    part.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(rot.X), math.rad(rot.Y), math.rad(rot.Z))
+    part:SetAttribute("VisualDirectorLocalCFrame", part.CFrame)
+    return part
+end
+
+local function createParticle(node, parent)
+    local part = anchorPart(node.name .. "_Anchor", node.position, node.rotation)
+    setCommon(part, node)
+    part.Parent = parent
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "EmitterAttachment"
+    attachment.Parent = part
+    local emitter = Instance.new("ParticleEmitter")
+    emitter.Name = node.name
+    emitter.Texture = node.texture or ""
+    emitter.Color = sequenceColor(node.color)
+    emitter.Transparency = sequenceNumber(node.transparency, 0)
+    emitter.Size = sequenceNumber(node.size, 1)
+    emitter.Lifetime = numberRange(node.lifetime, 0.5)
+    emitter.Speed = numberRange(node.speed, 0)
+    emitter.Rate = node.rate or 0
+    emitter.SpreadAngle = Vector2.new((node.spread and node.spread.x) or 0, (node.spread and node.spread.y) or 0)
+    emitter.Acceleration = vector3(node.acceleration)
+    emitter.Drag = node.drag or 0
+    emitter.RotSpeed = numberRange(node.rotationSpeed, 0)
+    emitter.LightEmission = node.lightEmission or 0
+    emitter.LightInfluence = node.lightInfluence == nil and 1 or node.lightInfluence
+    emitter.LockedToPart = node.lockedToPart == true
+    emitter.ZOffset = node.zOffset or 0
+    emitter.Enabled = (node.rate or 0) > 0
+    emitter:SetAttribute("BurstCount", node.burstCount or 0)
+    emitter.Parent = attachment
+end
+
+local function createBeam(node, parent)
+    local p0 = anchorPart(node.name .. "_From", node.from)
+    local p1 = anchorPart(node.name .. "_To", node.to)
+    setCommon(p0, node)
+    p1:SetAttribute("VisualDirectorNodeId", node.id)
+    p0.Parent, p1.Parent = parent, parent
+    local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+    a0.Name, a1.Name = "BeamFrom", "BeamTo"
+    a0.Parent, a1.Parent = p0, p1
+    local beam = Instance.new("Beam")
+    beam.Name = node.name
+    beam.Attachment0, beam.Attachment1 = a0, a1
+    beam.Width0, beam.Width1 = node.width0 or 1, node.width1 or 1
+    beam.Color = sequenceColor(node.color)
+    beam.Transparency = sequenceNumber(node.transparency, 0)
+    beam.Texture = node.texture or ""
+    beam.TextureSpeed = node.textureSpeed or 0
+    beam.TextureLength = node.textureLength or 1
+    beam.CurveSize0, beam.CurveSize1 = node.curve0 or 0, node.curve1 or 0
+    beam.FaceCamera = node.faceCamera ~= false
+    beam.Segments = node.segments or 10
+    beam.Parent = p0
+end
+
+local function createTrail(node, parent)
+    local part = anchorPart(node.name .. "_TrailAnchor", { x = 0, y = 0, z = 0 })
+    setCommon(part, node)
+    part.Parent = parent
+    local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+    a0.Position, a1.Position = vector3(node.attachment0), vector3(node.attachment1)
+    a0.Parent, a1.Parent = part, part
+    local trail = Instance.new("Trail")
+    trail.Name = node.name
+    trail.Attachment0, trail.Attachment1 = a0, a1
+    trail.Lifetime = node.lifetime or 0.25
+    trail.MinLength = node.minLength or 0
+    trail.Color = sequenceColor(node.color)
+    trail.Transparency = sequenceNumber(node.transparency, 0)
+    trail.WidthScale = sequenceNumber(node.widthScale, 1)
+    trail.Texture = node.texture or ""
+    trail.TextureLength = node.textureLength or 1
+    trail.FaceCamera = node.faceCamera ~= false
+    trail.Enabled = false
+    trail.Parent = part
+end
+
+local function createGeometry(node, parent)
+    local part = Instance.new(node.shape == "wedge" and "WedgePart" or "Part")
+    setCommon(part, node)
+    part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch = true, false, false, false
+    part.Size = vector3(node.size, Vector3.one)
+    part.Color = color(node.color)
+    part.Material = Enum.Material[node.material or "Neon"] or Enum.Material.Neon
+    part.Transparency = node.transparency or 0
+    if part:IsA("Part") then
+        if node.shape == "ball" then part.Shape = Enum.PartType.Ball end
+        if node.shape == "cylinder" or node.shape == "ring" then part.Shape = Enum.PartType.Cylinder end
+    end
+    local pos, rot = vector3(node.position), vector3(node.rotation)
+    part.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(rot.X), math.rad(rot.Y), math.rad(rot.Z))
+    part:SetAttribute("VisualDirectorLocalCFrame", part.CFrame)
+    part:SetAttribute("StartScale", vector3(node.startScale, Vector3.one))
+    part:SetAttribute("EndScale", vector3(node.endScale, Vector3.one))
+    part:SetAttribute("StartTransparency", node.startTransparency or 0)
+    part:SetAttribute("EndTransparency", node.endTransparency == nil and 1 or node.endTransparency)
+    part:SetAttribute("Easing", node.easing or "quadOut")
+    part.Parent = parent
+end
+
+local function createLight(node, parent)
+    local part = anchorPart(node.name .. "_LightAnchor", node.position)
+    setCommon(part, node)
+    part.Parent = parent
+    local className = node.lightType == "spot" and "SpotLight" or node.lightType == "surface" and "SurfaceLight" or "PointLight"
+    local light = Instance.new(className)
+    light.Name = node.name
+    light.Color = color(node.color)
+    light.Brightness = node.brightness or 1
+    light.Range = node.range or 16
+    light.Shadows = node.shadows == true
+    if light:IsA("SpotLight") then light.Angle = node.angle or 90 end
+    light.Parent = part
+end
+
+local function createScreen(node, parent)
+    local gui = parent:FindFirstChild("ScreenLayers")
+    if not gui then
+        gui = Instance.new("ScreenGui")
+        gui.Name = "ScreenLayers"
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 1000
+        gui.Parent = parent
+    end
+    local className = node.layerType == "image" and "ImageLabel" or node.layerType == "text" and "TextLabel" or "Frame"
+    local layer = Instance.new(className)
+    setCommon(layer, node)
+    layer.AnchorPoint = Vector2.new((node.anchor and node.anchor.x) or 0.5, (node.anchor and node.anchor.y) or 0.5)
+    layer.Position = UDim2.fromScale((node.position and node.position.x) or 0.5, (node.position and node.position.y) or 0.5)
+    layer.Size = UDim2.fromScale((node.size and node.size.x) or 1, (node.size and node.size.y) or 1)
+    layer.Rotation = node.rotation or 0
+    layer.BackgroundColor3 = color(node.color)
+    layer.BackgroundTransparency = node.transparency or 0
+    layer.BorderSizePixel = 0
+    layer.ZIndex = node.zIndex or 1
+    layer:SetAttribute("StartScale", node.startScale or 1)
+    layer:SetAttribute("EndScale", node.endScale or 1)
+    layer:SetAttribute("StartTransparency", node.startTransparency or 0)
+    layer:SetAttribute("EndTransparency", node.endTransparency == nil and 1 or node.endTransparency)
+    if layer:IsA("ImageLabel") then
+        layer.Image = node.image or ""
+        layer.ImageColor3 = color(node.color)
+        layer.ImageTransparency = node.transparency or 0
+        layer.BackgroundTransparency = 1
+    elseif layer:IsA("TextLabel") then
+        layer.Text = node.text or ""
+        layer.TextColor3 = color(node.color)
+        layer.TextTransparency = node.transparency or 0
+        layer.TextScaled = true
+        layer.Font = Enum.Font[node.font or "GothamBold"] or Enum.Font.GothamBold
+        layer.BackgroundTransparency = 1
+    end
+    layer.Parent = gui
+end
+
+local function createCamera(node, parent)
+    local folder = Instance.new("Folder")
+    setCommon(folder, node)
+    folder:SetAttribute("ShakeAmplitude", vector3(node.shakeAmplitude))
+    folder:SetAttribute("ShakeFrequency", node.shakeFrequency or 18)
+    folder:SetAttribute("FovDelta", node.fovDelta or 0)
+    folder:SetAttribute("ChromaticAberration", node.chromaticAberration or 0)
+    folder:SetAttribute("Blur", node.blur or 0)
+    folder:SetAttribute("ColorTint", color(node.colorTint))
+    folder:SetAttribute("Contrast", node.contrast or 0)
+    folder:SetAttribute("Saturation", node.saturation or 0)
+    folder.Parent = parent
+end
+
+local function createSound(node, parent)
+    local sound = Instance.new("Sound")
+    setCommon(sound, node)
+    sound.SoundId = node.soundId or ""
+    sound.Volume = node.volume or 1
+    sound.PlaybackSpeed = node.playbackSpeed or 1
+    sound.RollOffMaxDistance = node.rollOffMaxDistance or 100
+    sound.Parent = parent
+end
+
+local creators = {
+    particle = createParticle, beam = createBeam, trail = createTrail, geometry = createGeometry,
+    light = createLight, screen = createScreen, camera = createCamera, sound = createSound,
+}
+
+local function ensureFolder(parent, name)
+    local folder = parent:FindFirstChild(name)
+    if not folder then folder = Instance.new("Folder"); folder.Name = name; folder.Parent = parent end
+    return folder
+end
+
+local function selectedTarget()
+    local selected = Selection:Get()
+    return selected[1]
+end
+
+local function buildPackage(draft, destinationName)
+    local rootFolder = ensureFolder(ReplicatedStorage, "VisualDirectorVFX")
+    local existing = rootFolder:FindFirstChild(destinationName)
+    if existing then existing:Destroy() end
+    local package = Instance.new("Folder")
+    package.Name = destinationName
+    package:SetAttribute("VisualDirectorPackage", true)
+    package:SetAttribute("SchemaVersion", draft.schemaVersion or 1)
+    package:SetAttribute("Category", draft.category)
+    package:SetAttribute("Duration", draft.duration)
+    package:SetAttribute("FramesPerSecond", draft.framesPerSecond or 60)
+    package:SetAttribute("Looped", draft.looped == true)
+    package:SetAttribute("Intent", draft.intent)
+    package:SetAttribute("SourceDraft", HttpService:JSONEncode(draft))
+    package.Parent = rootFolder
+    local nodes = ensureFolder(package, "Nodes")
+    for _, node in ipairs(draft.nodes or {}) do
+        local creator = creators[node.kind]
+        if creator and node.enabled ~= false then creator(node, nodes) end
+    end
+    local markers = ensureFolder(package, "Markers")
+    for _, marker in ipairs(draft.markers or {}) do
+        local value = Instance.new("NumberValue")
+        value.Name = marker.id
+        value.Value = marker.time
+        value:SetAttribute("Type", marker.type)
+        value:SetAttribute("Label", marker.label)
+        value.Parent = markers
+    end
+    return package
+end
+
+local function inspectInstance(root, maxResults)
+    local items = {}
+    for _, item in ipairs(root:GetDescendants()) do
+        if #items >= maxResults then break end
+        if item:IsA("ParticleEmitter") or item:IsA("Beam") or item:IsA("Trail") or item:IsA("Light") or item:IsA("GuiObject") or item:GetAttribute("VisualDirectorNodeId") then
+            table.insert(items, {
+                path = item:GetFullName(), name = item.Name, className = item.ClassName,
+                nodeId = item:GetAttribute("VisualDirectorNodeId"), kind = item:GetAttribute("VisualDirectorKind"),
+                startTime = item:GetAttribute("StartTime"), endTime = item:GetAttribute("EndTime"),
+            })
+        end
+    end
+    return items
+end
+
+local handlers = {}
+handlers["system.capabilities"] = function()
+    return {
+        plugin = "Visual Director", pluginVersion = PLUGIN_VERSION, schemaVersion = 1,
+        supportedNodes = { "particle", "beam", "trail", "geometry", "light", "screen", "camera", "sound" },
+        supportedCategories = { "attack", "impactFrame", "hud", "environment", "characterAura", "cinematic", "custom" },
+        maxNodes = 500, maxDuration = 120, transactionalCommit = true, selectionAttachment = true,
+        arbitraryCodeExecution = false,
+    }
+end
+
+handlers["scene.getSelection"] = function(params)
+    local result = {}
+    for _, item in ipairs(Selection:Get()) do
+        table.insert(result, { path = item:GetFullName(), name = item.Name, className = item.ClassName, descendantCount = #item:GetDescendants() })
+    end
+    return { count = #result, items = result }
+end
+
+handlers["vfx.inspectSelected"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select a target before inspecting VFX.") end
+    local items = inspectInstance(target, math.clamp(params.maxResults or 300, 1, 1000))
+    return { target = target:GetFullName(), count = #items, items = items }
+end
+
+handlers["vfx.stageDraft"] = function(params)
+    if type(params.transactionName) ~= "string" or params.transactionName == "" then error("transactionName is required.") end
+    if type(params.draft) ~= "table" then error("A complete draft is required.") end
+    local staging = ensureFolder(ServerStorage, "VisualDirectorStaging")
+    local transactionId = HttpService:GenerateGUID(false)
+    local value = Instance.new("StringValue")
+    value.Name = transactionId
+    value.Value = HttpService:JSONEncode(params.draft)
+    value:SetAttribute("TransactionName", params.transactionName)
+    value:SetAttribute("CreatedAt", os.time())
+    value.Parent = staging
+    return { status = "staged", transactionId = transactionId, transactionName = params.transactionName, draftName = params.draft.name, nodeCount = #(params.draft.nodes or {}) }
+end
+
+handlers["vfx.commitDraft"] = function(params)
+    local staging = ServerStorage:FindFirstChild("VisualDirectorStaging")
+    local staged = staging and staging:FindFirstChild(params.transactionId)
+    if not staged or not staged:IsA("StringValue") then error("Staged transaction not found: " .. tostring(params.transactionId)) end
+    local destinationName = params.destinationName
+    if type(destinationName) ~= "string" or destinationName == "" then error("destinationName is required.") end
+    ChangeHistoryService:SetWaypoint("Before Visual Director commit")
+    local draft = HttpService:JSONDecode(staged.Value)
+    local package = buildPackage(draft, destinationName)
+    staged:Destroy()
+    ChangeHistoryService:SetWaypoint("Commit Visual Director package " .. destinationName)
+    return { status = "committed", packageName = package.Name, path = package:GetFullName(), nodeCount = #(draft.nodes or {}), duration = draft.duration }
+end
+
+local function targetPivot(target)
+    if target:IsA("Model") then return target:GetPivot() end
+    if target:IsA("BasePart") then return target.CFrame end
+    local model = target:FindFirstAncestorOfClass("Model")
+    return model and model:GetPivot() or CFrame.identity
+end
+
+local function placeCloneAtTarget(clone, target)
+    local pivot = targetPivot(target)
+    for _, item in ipairs(clone:GetDescendants()) do
+        if item:IsA("BasePart") then
+            local localCFrame = item:GetAttribute("VisualDirectorLocalCFrame")
+            if typeof(localCFrame) == "CFrame" then item.CFrame = pivot * localCFrame end
+        end
+    end
+end
+
+handlers["vfx.attachCommitted"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select the target Instance before attaching VFX.") end
+    local committedRoot = ReplicatedStorage:FindFirstChild("VisualDirectorVFX")
+    local source = committedRoot and committedRoot:FindFirstChild(params.packageName)
+    if not source then error("Committed VFX package not found: " .. tostring(params.packageName)) end
+    ChangeHistoryService:SetWaypoint("Before Visual Director attach")
+    local destination = ensureFolder(target, "VisualDirectorVFX")
+    local old = destination:FindFirstChild(source.Name)
+    if old then old:Destroy() end
+    local clone = source:Clone()
+    clone:SetAttribute("AttachedTarget", target:GetFullName())
+    clone.Parent = destination
+    placeCloneAtTarget(clone, target)
+    ChangeHistoryService:SetWaypoint("Attach Visual Director package " .. source.Name)
+    return { status = "attached", packageName = source.Name, target = target:GetFullName(), path = clone:GetFullName() }
+end
+
+local function setPreviewState(root, time)
+    for _, item in ipairs(root:GetDescendants()) do
+        local startTime, endTime = item:GetAttribute("StartTime"), item:GetAttribute("EndTime")
+        if type(startTime) == "number" and type(endTime) == "number" then
+            local active = time >= startTime and time <= endTime
+            if item:IsA("ParticleEmitter") then
+                item.Enabled = active and item.Rate > 0
+                if active then local burst = item:GetAttribute("BurstCount"); if type(burst) == "number" and burst > 0 then item:Emit(burst) end end
+            elseif item:IsA("Beam") or item:IsA("Trail") or item:IsA("Light") then item.Enabled = active
+            elseif item:IsA("GuiObject") then item.Visible = active
+            elseif item:IsA("BasePart") and item:GetAttribute("VisualDirectorKind") == "geometry" then item.Transparency = active and (item:GetAttribute("StartTransparency") or item.Transparency) or 1 end
+        end
+    end
+end
+
+handlers["vfx.previewCommitted"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select a preview target.") end
+    local committedRoot = ReplicatedStorage:FindFirstChild("VisualDirectorVFX")
+    local source = committedRoot and committedRoot:FindFirstChild(params.packageName)
+    if not source then error("Committed VFX package not found: " .. tostring(params.packageName)) end
+    local previous = workspace:FindFirstChild("VisualDirectorPreview")
+    if previous then previous:Destroy() end
+    local preview = Instance.new("Folder")
+    preview.Name = "VisualDirectorPreview"
+    preview:SetAttribute("VisualDirectorPreview", true)
+    preview.Parent = workspace
+    local clone = source:Clone()
+    clone.Parent = preview
+    placeCloneAtTarget(clone, target)
+    local normalized = math.clamp(params.normalizedTime or 0.5, 0, 1)
+    local duration = source:GetAttribute("Duration") or 1
+    setPreviewState(clone, normalized * duration)
+    Selection:Set({ target })
+    return { status = "previewed", packageName = source.Name, target = target:GetFullName(), normalizedTime = normalized, previewPath = preview:GetFullName() }
+end
+
+local function executeCommand(command)
+    local handler = handlers[command.method]
+    if not handler then error("Unsupported Visual Director command: " .. tostring(command.method)) end
+    return handler(type(command.params) == "table" and command.params or {})
+end
+
+local function isLocal()
+    return string.find(relayUrl, "127.0.0.1", 1, true) ~= nil or string.find(relayUrl, "localhost", 1, true) ~= nil
+end
+
+local function connect()
+    relayUrl = trimUrl(relayBox.Text)
+    if relayUrl == "" then error("Relay URL is empty.") end
+    plugin:SetSetting(SETTINGS.relay, relayUrl)
+    launchId = HttpService:GenerateGUID(false)
+    token = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
+    if isLocal() then
+        local result = request("POST", "/plugin/connect", {
+            studioUserId = game.CreatorId, placeId = game.PlaceId, placeName = game.Name, pluginVersion = PLUGIN_VERSION,
+        })
+        sessionId = result.sessionId
+    else
+        request("POST", "/v1/plugin/register", {
+            installationId = installationId, launchId = launchId, pairingCode = pairingCode, token = token,
+            studioUserId = game.CreatorId, placeId = game.PlaceId, placeName = game.Name, pluginVersion = PLUGIN_VERSION,
+        })
+        sessionId = nil
+    end
+    connected = true
+    setStatus("Conectado a " .. relayUrl, true)
+end
+
+local function pollOnce()
+    local path, payload
+    if isLocal() then
+        path, payload = "/plugin/poll", { sessionId = sessionId }
+    else
+        path, payload = "/v1/plugin/poll", { installationId = installationId, launchId = launchId, pairingCode = pairingCode, token = token }
+    end
+    local response = request("POST", path, payload)
+    if response.reconnect then connected = false; return end
+    local command = response.command
+    if not command then return end
+    local ok, result = pcall(executeCommand, command)
+    local resultPath, resultBody
+    if isLocal() then
+        resultPath = "/plugin/result"
+        resultBody = { sessionId = sessionId, id = command.id, ok = ok, result = ok and result or nil, error = ok and nil or { code = "studio_error", message = tostring(result) } }
+    else
+        resultPath = "/v1/plugin/result"
+        resultBody = {
+            installationId = installationId, launchId = launchId, pairingCode = pairingCode, token = token,
+            id = command.id, ok = ok, result = ok and result or nil, error = ok and nil or { code = "studio_error", message = tostring(result) },
+        }
+    end
+    request("POST", resultPath, resultBody)
+end
+
+connectButton.MouseButton1Click:Connect(function()
+    connectButton.Active = false
+    setStatus("Conectando...", false)
+    local ok, err = pcall(connect)
+    if not ok then connected = false; setStatus("Falha: " .. tostring(err), false) end
+    connectButton.Active = true
+end)
+
+task.spawn(function()
+    while running do
+        if connected then
+            local ok, err = pcall(pollOnce)
+            if not ok then connected = false; setStatus("Desconectado: " .. tostring(err), false) end
+        end
+        task.wait(connected and 0.5 or 1.2)
+    end
+end)
+
+plugin.Unloading:Connect(function() running = false end)
