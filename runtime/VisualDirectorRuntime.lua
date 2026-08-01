@@ -1,0 +1,468 @@
+--!strict
+-- Visual Director runtime playback.
+--
+-- A committed package only stores its timeline as attributes: the plugin never
+-- animates anything, so a package sitting in the workspace shows every node at
+-- once, frozen. This module is the missing consumer. It walks a package, reads
+-- the authored StartTime/EndTime/StartScale/EndScale/Easing attributes, and
+-- drives them over real time.
+--
+--   local Runtime = require(path.to.VisualDirectorRuntime)
+--   local playback = Runtime.play(character.VisualDirectorVFX.VD_KamehamehaCharge_V1)
+--   playback.finished:Wait()
+--
+-- Node roots are the instances carrying a StartTime attribute. The effect
+-- instances themselves (ParticleEmitter, Beam, Trail, Light, Sound) hang below
+-- that root, which is why the plugin's own single-frame preview misses them:
+-- it looks for StartTime on the emitter instead of on its anchor part.
+
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+
+local Runtime = {}
+
+export type PlayOptions = {
+	speed: number?,
+	loop: boolean?,
+	-- Camera shake and post effects are client-only and are skipped on the
+	-- server rather than erroring, so the same call works in both contexts.
+	applyCameraEffects: boolean?,
+}
+
+local easings: { [string]: (number) -> number } = {
+	linear = function(t)
+		return t
+	end,
+	quadIn = function(t)
+		return t * t
+	end,
+	quadOut = function(t)
+		return 1 - (1 - t) * (1 - t)
+	end,
+	quadInOut = function(t)
+		if t < 0.5 then
+			return 2 * t * t
+		end
+		local f = -2 * t + 2
+		return 1 - (f * f) / 2
+	end,
+	backOut = function(t)
+		local c1, c3 = 1.70158, 2.70158
+		local f = t - 1
+		return 1 + c3 * f * f * f + c1 * f * f
+	end,
+	expoOut = function(t)
+		if t >= 1 then
+			return 1
+		end
+		return 1 - 2 ^ (-10 * t)
+	end,
+}
+
+local function ease(name: string?, t: number): number
+	local fn = easings[name or "quadOut"] or easings.quadOut
+	return fn(math.clamp(t, 0, 1))
+end
+
+local function lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+type Node = {
+	root: Instance,
+	startTime: number,
+	endTime: number,
+	kind: string?,
+	-- Effect instances driven by this node.
+	emitters: { ParticleEmitter },
+	beams: { Beam },
+	trails: { Trail },
+	lights: { Light },
+	sounds: { Sound },
+	part: BasePart?,
+	gui: GuiObject?,
+	-- Captured so playback is reversible and repeatable.
+	baseSize: Vector3?,
+	baseTransparency: number?,
+	baseGuiSize: UDim2?,
+	active: boolean,
+	propertyCurves: { any },
+}
+
+local function collect(root: Instance): Node?
+	local startTime = root:GetAttribute("StartTime")
+	local endTime = root:GetAttribute("EndTime")
+	if type(startTime) ~= "number" or type(endTime) ~= "number" then
+		return nil
+	end
+	if root:GetAttribute("EnabledByDraft") == false then
+		return nil
+	end
+
+	local node: Node = {
+		root = root,
+		startTime = startTime,
+		endTime = math.max(endTime, startTime + 1e-4),
+		kind = root:GetAttribute("VisualDirectorKind"),
+		emitters = {},
+		beams = {},
+		trails = {},
+		lights = {},
+		sounds = {},
+		active = false,
+		propertyCurves = {},
+	}
+	local encodedCurves = root:GetAttribute("VisualDirectorPropertyCurves")
+	if type(encodedCurves) == "string" and encodedCurves ~= "" then
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(encodedCurves) end)
+		if ok and type(decoded) == "table" then node.propertyCurves = decoded end
+	end
+
+	if root:IsA("BasePart") then
+		node.part = root
+		node.baseSize = root.Size
+		node.baseTransparency = root.Transparency
+	elseif root:IsA("GuiObject") then
+		node.gui = root
+		node.baseGuiSize = root.Size
+	end
+
+	-- A node's effect instances live under its anchor, except beams, which the
+	-- plugin parents to the "From" anchor part.
+	for _, item in ipairs(root:GetDescendants()) do
+		if item:IsA("ParticleEmitter") then
+			table.insert(node.emitters, item)
+		elseif item:IsA("Beam") then
+			table.insert(node.beams, item)
+		elseif item:IsA("Trail") then
+			table.insert(node.trails, item)
+		elseif item:IsA("Light") then
+			table.insert(node.lights, item)
+		elseif item:IsA("Sound") then
+			table.insert(node.sounds, item)
+		end
+	end
+	if root:IsA("Sound") then
+		table.insert(node.sounds, root)
+	end
+
+	return node
+end
+
+local curveWritable = {
+	particle = { Rate = true, Drag = true, LightEmission = true, LightInfluence = true, ZOffset = true, TimeScale = true, VelocityInheritance = true },
+	beam = { Width0 = true, Width1 = true, CurveSize0 = true, CurveSize1 = true, TextureSpeed = true, LightEmission = true, LightInfluence = true, Brightness = true },
+	trail = { Lifetime = true, MinLength = true, LightEmission = true, LightInfluence = true, Brightness = true },
+	light = { Brightness = true, Range = true },
+	part = { Transparency = true, Reflectance = true },
+	gui = { Rotation = true, BackgroundTransparency = true },
+}
+
+local function evaluateCurve(curve, progress: number): number?
+	local keys = curve.keys
+	if type(keys) ~= "table" or #keys == 0 then return nil end
+	local before, after = keys[1], keys[#keys]
+	for index = 1, #keys do
+		local key = keys[index]
+		if key.time <= progress then before = key end
+		if key.time >= progress then after = key; break end
+	end
+	if type(before.value) ~= "number" or type(after.value) ~= "number" then return nil end
+	local span = after.time - before.time
+	local alpha = if span <= 0 then 0 else math.clamp((progress - before.time) / span, 0, 1)
+	if curve.interpolation == "step" then alpha = 0
+	elseif curve.interpolation == "smooth" then alpha = alpha * alpha * (3 - 2 * alpha) end
+	return lerp(before.value, after.value, alpha)
+end
+
+local function applyPropertyCurves(node: Node, progress: number)
+	for _, curve in ipairs(node.propertyCurves) do
+		local allowed = curveWritable[curve.target]
+		if allowed and allowed[curve.property] then
+			local value = evaluateCurve(curve, progress)
+			if value ~= nil then
+				local targets = if curve.target == "particle" then node.emitters
+					else if curve.target == "beam" then node.beams
+					else if curve.target == "trail" then node.trails
+					else if curve.target == "light" then node.lights
+					else if curve.target == "part" then (node.part and { node.part } or {})
+					else if curve.target == "gui" then (node.gui and { node.gui } or {})
+					else {}
+				for _, target in ipairs(targets) do pcall(function() target[curve.property] = value end) end
+			end
+		end
+	end
+end
+
+local function setActive(node: Node, active: boolean)
+	if node.active == active then
+		return
+	end
+	node.active = active
+
+	for _, emitter in ipairs(node.emitters) do
+		emitter.Enabled = active and emitter.Rate > 0
+		if active then
+			local burst = emitter:GetAttribute("BurstCount")
+			if type(burst) == "number" and burst > 0 then
+				emitter:Emit(burst)
+			end
+		end
+	end
+	for _, beam in ipairs(node.beams) do
+		beam.Enabled = active
+	end
+	for _, trail in ipairs(node.trails) do
+		trail.Enabled = active
+	end
+	for _, light in ipairs(node.lights) do
+		light.Enabled = active
+	end
+	for _, sound in ipairs(node.sounds) do
+		if active then
+			sound:Play()
+		else
+			sound:Stop()
+		end
+	end
+	if node.gui then
+		node.gui.Visible = active
+	end
+	if node.part and node.kind == "geometry" and not active then
+		node.part.Transparency = 1
+	end
+end
+
+-- Scale and transparency are the two channels the schema animates, and both
+-- are stored as start/end pairs plus an easing name.
+local function applyProgress(node: Node, progress: number)
+	local eased = ease(node.root:GetAttribute("Easing"), progress)
+
+	local part = node.part
+	if part and node.kind == "geometry" and node.baseSize then
+		local startScale = node.root:GetAttribute("StartScale")
+		local endScale = node.root:GetAttribute("EndScale")
+		if typeof(startScale) == "Vector3" and typeof(endScale) == "Vector3" then
+			part.Size = node.baseSize * startScale:Lerp(endScale, eased)
+		end
+		local from = node.root:GetAttribute("StartTransparency")
+		local to = node.root:GetAttribute("EndTransparency")
+		if type(from) == "number" and type(to) == "number" then
+			part.Transparency = math.clamp(lerp(from, to, eased), 0, 1)
+		end
+	end
+
+	local gui = node.gui
+	if gui and node.baseGuiSize then
+		local startScale = node.root:GetAttribute("StartScale")
+		local endScale = node.root:GetAttribute("EndScale")
+		if type(startScale) == "number" and type(endScale) == "number" then
+			local factor = lerp(startScale, endScale, eased)
+			local base = node.baseGuiSize
+			gui.Size = UDim2.new(
+				base.X.Scale * factor,
+				base.X.Offset * factor,
+				base.Y.Scale * factor,
+				base.Y.Offset * factor
+			)
+		end
+		local from = node.root:GetAttribute("StartTransparency")
+		local to = node.root:GetAttribute("EndTransparency")
+		if type(from) == "number" and type(to) == "number" then
+			local value = math.clamp(lerp(from, to, eased), 0, 1)
+			if gui:IsA("ImageLabel") then
+				gui.ImageTransparency = value
+			elseif gui:IsA("TextLabel") then
+				gui.TextTransparency = value
+			else
+				gui.BackgroundTransparency = value
+			end
+		end
+	end
+	applyPropertyCurves(node, progress)
+end
+
+local function restore(node: Node)
+	setActive(node, false)
+	local part = node.part
+	if part and node.baseSize then
+		part.Size = node.baseSize
+		if node.baseTransparency then
+			part.Transparency = node.baseTransparency
+		end
+	end
+	if node.gui and node.baseGuiSize then
+		node.gui.Size = node.baseGuiSize
+	end
+end
+
+-- Camera nodes are folders of attributes. Roblox has no chromatic aberration
+-- post effect, so that field is deliberately ignored rather than faked.
+local function makeCameraDriver(nodes: { Node })
+	local cameraNodes = {}
+	for _, node in ipairs(nodes) do
+		if node.kind == "camera" then
+			table.insert(cameraNodes, node)
+		end
+	end
+	if #cameraNodes == 0 or not RunService:IsClient() then
+		return nil
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+
+	local blur = Instance.new("BlurEffect")
+	blur.Name = "VisualDirectorBlur"
+	blur.Size = 0
+	blur.Parent = Lighting
+	local grade = Instance.new("ColorCorrectionEffect")
+	grade.Name = "VisualDirectorGrade"
+	grade.Parent = Lighting
+
+	local baseFov = camera.FieldOfView
+
+	local function update(time: number)
+		local shake, fov, blurSize, contrast, saturation = Vector3.zero, 0, 0, 0, 0
+		local tint = Color3.new(1, 1, 1)
+		for _, node in ipairs(cameraNodes) do
+			if time >= node.startTime and time <= node.endTime then
+				local amplitude = node.root:GetAttribute("ShakeAmplitude")
+				local frequency = node.root:GetAttribute("ShakeFrequency") or 18
+				-- Fade the shake out across the node so it never cuts hard.
+				local span = node.endTime - node.startTime
+				local falloff = 1 - math.clamp((time - node.startTime) / span, 0, 1)
+				if typeof(amplitude) == "Vector3" then
+					local phase = time * (frequency :: number) * math.pi * 2
+					shake += Vector3.new(
+						math.sin(phase) * amplitude.X,
+						math.sin(phase * 1.37 + 1.1) * amplitude.Y,
+						math.sin(phase * 0.81 + 2.3) * amplitude.Z
+					) * falloff
+				end
+				fov += (node.root:GetAttribute("FovDelta") or 0) :: number
+				blurSize = math.max(blurSize, (node.root:GetAttribute("Blur") or 0) :: number)
+				contrast += (node.root:GetAttribute("Contrast") or 0) :: number
+				saturation += (node.root:GetAttribute("Saturation") or 0) :: number
+				local nodeTint = node.root:GetAttribute("ColorTint")
+				if typeof(nodeTint) == "Color3" then
+					tint = nodeTint
+				end
+			end
+		end
+		camera.FieldOfView = baseFov + fov
+		camera.CFrame = camera.CFrame * CFrame.new(shake)
+		blur.Size = blurSize
+		grade.Contrast = contrast
+		grade.Saturation = saturation
+		grade.TintColor = tint
+	end
+
+	local function cleanup()
+		camera.FieldOfView = baseFov
+		blur:Destroy()
+		grade:Destroy()
+	end
+
+	return { update = update, cleanup = cleanup }
+end
+
+export type Playback = {
+	stop: (Playback) -> (),
+	setTime: (Playback, number) -> (),
+	finished: RBXScriptSignal,
+}
+
+function Runtime.play(root: Instance, options: PlayOptions?): Playback
+	assert(root, "A committed Visual Director package is required.")
+	local settings = options or {}
+	local speed = settings.speed or 1
+	assert(speed > 0, "speed must be positive")
+
+	local nodes: { Node } = {}
+	local duration = 0
+	for _, item in ipairs(root:GetDescendants()) do
+		local node = collect(item)
+		if node then
+			table.insert(nodes, node)
+			duration = math.max(duration, node.endTime)
+		end
+	end
+	local declared = root:GetAttribute("Duration")
+	if type(declared) == "number" and declared > 0 then
+		duration = math.max(duration, declared)
+	end
+
+	-- Start from a clean slate: the plugin leaves every emitter enabled, so
+	-- without this the first frame shows the whole effect at once.
+	for _, node in ipairs(nodes) do
+		node.active = true
+		setActive(node, false)
+	end
+
+	local camera = settings.applyCameraEffects ~= false and makeCameraDriver(nodes) or nil
+	local finished = Instance.new("BindableEvent")
+	local elapsed = 0
+	local connection: RBXScriptConnection? = nil
+	local stopped = false
+
+	local playback = {} :: any
+	playback.finished = finished.Event
+
+	local function applyAt(time: number)
+		for _, node in ipairs(nodes) do
+			local active = time >= node.startTime and time <= node.endTime
+			setActive(node, active)
+			if active then
+				applyProgress(node, (time - node.startTime) / (node.endTime - node.startTime))
+			end
+		end
+		if camera then
+			camera.update(time)
+		end
+	end
+
+	function playback:setTime(time: number)
+		elapsed = math.clamp(time, 0, duration)
+		applyAt(elapsed)
+	end
+
+	function playback:stop()
+		if stopped then
+			return
+		end
+		stopped = true
+		if connection then
+			connection:Disconnect()
+			connection = nil
+		end
+		for _, node in ipairs(nodes) do
+			restore(node)
+		end
+		if camera then
+			camera.cleanup()
+		end
+		finished:Fire()
+	end
+
+	connection = RunService.Heartbeat:Connect(function(delta)
+		elapsed += delta * speed
+		if elapsed >= duration then
+			if settings.loop then
+				elapsed = elapsed % duration
+			else
+				applyAt(duration)
+				playback:stop()
+				return
+			end
+		end
+		applyAt(elapsed)
+	end)
+
+	return playback
+end
+
+return Runtime

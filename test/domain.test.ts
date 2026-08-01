@@ -36,3 +36,16 @@ test("rejects nodes outside the duration", () => {
   const draft = parseVfxDraft({ ...impactDraft, nodes: impactDraft.nodes.map((node, index) => index === 0 ? { ...node, endTime: 0.8 } : node) });
   assert.equal(reviewVfxDraft(draft).blockingIssues[0]?.code, "node_outside_duration");
 });
+
+test("accepts Studio-native property curves on a VFX node", () => {
+  const curved: any = structuredClone(impactDraft);
+  curved.nodes[3] = {
+    ...curved.nodes[3]!,
+    propertyCurves: [{
+      target: "part" as const, property: "Transparency", interpolation: "smooth" as const,
+      keys: [{ time: 0, value: 0 }, { time: 0.7, value: 0.15 }, { time: 1, value: 1 }],
+    }],
+  };
+  const parsed = parseVfxDraft(curved);
+  assert.equal(parsed.nodes[3]?.propertyCurves.length, 1);
+});

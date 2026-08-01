@@ -1,0 +1,6 @@
+{
+  "name": "VisualDirectorRuntime",
+  "tree": {
+    "$path": "runtime/VisualDirectorRuntime.lua"
+  }
+}

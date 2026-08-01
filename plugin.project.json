@@ -4,6 +4,9 @@
     "$className": "Folder",
     "VisualDirectorPlugin": {
       "$path": "studio-plugin/VisualDirectorPlugin.server.lua"
+    },
+    "VisualDirectorRuntime": {
+      "$path": "runtime/VisualDirectorRuntime.lua"
     }
   }
 }

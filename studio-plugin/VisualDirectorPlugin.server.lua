@@ -3,13 +3,18 @@ local Selection = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local VisualDirectorRuntime = require(script.Parent:WaitForChild("VisualDirectorRuntime"))
 
-local PLUGIN_VERSION = "0.1.0"
+-- 0.1.2 adds particle emitter shape support (Shape/ShapeStyle/ShapeInOut/
+-- EmissionDirection). Drafts relying on inward convergence must not be
+-- committed by an older plugin, which would drop those fields silently.
+local PLUGIN_VERSION = "0.4.0"
 local DEFAULT_RELAY = "https://visual-director-relay.onrender.com"
 local SETTINGS = {
     relay = "VisualDirectorRelayUrlV1",
     installation = "VisualDirectorInstallationIdV1",
     pairing = "VisualDirectorPairingCodeV1",
+    remoteConsent = "VisualDirectorRemoteDisclosureAcceptedV1",
 }
 
 local function ensureSetting(key, factory)
@@ -35,6 +40,16 @@ local token = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
 local sessionId = nil
 local connected = false
 local running = true
+local activeTimelinePlayback = nil
+-- Reconnection is intent-driven. The plugin never reaches out to a relay on
+-- its own: it only starts retrying once the user has explicitly connected at
+-- least once. After that, a dropped session (the local bridge restarting
+-- between MCP calls, for example) recovers without another button press.
+local remoteConsentAccepted = plugin:GetSetting(SETTINGS.remoteConsent) == true
+local relayLooksLocal = string.find(relayUrl, "127.0.0.1", 1, true) ~= nil or string.find(relayUrl, "localhost", 1, true) ~= nil
+local shouldConnect = relayLooksLocal or remoteConsentAccepted
+local disclosureArmed = false
+local nextRetryClock = 0
 
 local toolbar = plugin:CreateToolbar("Visual Director")
 local openButton = toolbar:CreateButton("Visual Director", "AI VFX, impact frames and HUD authoring", "rbxassetid://14978048121")
@@ -114,7 +129,7 @@ local connectButton = Instance.new("TextButton")
 connectButton.Size = UDim2.new(1, 0, 0, 40)
 connectButton.BackgroundColor3 = Color3.fromRGB(91, 92, 230)
 connectButton.BorderSizePixel = 0
-connectButton.Text = "Conectar"
+connectButton.Text = shouldConnect and "Reconectar" or "Autorizar conexao"
 connectButton.TextColor3 = Color3.new(1, 1, 1)
 connectButton.Font = Enum.Font.GothamBold
 connectButton.TextSize = 14
@@ -173,7 +188,7 @@ end
 
 local function sequenceNumber(stops, fallback)
     local keys = {}
-    for _, stop in ipairs(stops or {}) do table.insert(keys, NumberSequenceKeypoint.new(stop.time or 0, stop.value or fallback or 0)) end
+    for _, stop in ipairs(stops or {}) do table.insert(keys, NumberSequenceKeypoint.new(stop.time or 0, stop.value or fallback or 0, stop.envelope or 0)) end
     if #keys == 0 then keys = { NumberSequenceKeypoint.new(0, fallback or 0), NumberSequenceKeypoint.new(1, fallback or 0) } end
     if keys[1].Time ~= 0 then table.insert(keys, 1, NumberSequenceKeypoint.new(0, keys[1].Value)) end
     if keys[#keys].Time ~= 1 then table.insert(keys, NumberSequenceKeypoint.new(1, keys[#keys].Value)) end
@@ -192,6 +207,9 @@ local function setCommon(instance, node)
     instance:SetAttribute("StartTime", node.startTime or 0)
     instance:SetAttribute("EndTime", node.endTime or 0)
     instance:SetAttribute("EnabledByDraft", node.enabled ~= false)
+    if type(node.propertyCurves) == "table" and #node.propertyCurves > 0 then
+        instance:SetAttribute("VisualDirectorPropertyCurves", HttpService:JSONEncode(node.propertyCurves))
+    end
 end
 
 local function anchorPart(name, position, rotation)
@@ -210,8 +228,57 @@ local function anchorPart(name, position, rotation)
     return part
 end
 
+local particleShapes = {
+    -- Roblox has no point shape; a tiny box is the point emitter.
+    point = Enum.ParticleEmitterShape.Box,
+    box = Enum.ParticleEmitterShape.Box,
+    sphere = Enum.ParticleEmitterShape.Sphere,
+    cylinder = Enum.ParticleEmitterShape.Cylinder,
+    disc = Enum.ParticleEmitterShape.Disc,
+}
+local particleShapeStyles = {
+    volume = Enum.ParticleEmitterShapeStyle.Volume,
+    surface = Enum.ParticleEmitterShapeStyle.Surface,
+}
+local particleShapeInOut = {
+    outward = Enum.ParticleEmitterShapeInOut.Outward,
+    inward = Enum.ParticleEmitterShapeInOut.Inward,
+    inAndOut = Enum.ParticleEmitterShapeInOut.InAndOut,
+}
+local emissionDirections = {
+    top = Enum.NormalId.Top, bottom = Enum.NormalId.Bottom,
+    front = Enum.NormalId.Front, back = Enum.NormalId.Back,
+    left = Enum.NormalId.Left, right = Enum.NormalId.Right,
+}
+local particleOrientations = {
+    facingCamera = Enum.ParticleOrientation.FacingCamera,
+    facingCameraWorldUp = Enum.ParticleOrientation.FacingCameraWorldUp,
+    velocityParallel = Enum.ParticleOrientation.VelocityParallel,
+    velocityPerpendicular = Enum.ParticleOrientation.VelocityPerpendicular,
+}
+local flipbookLayouts = {
+    none = Enum.ParticleFlipbookLayout.None,
+    grid2x2 = Enum.ParticleFlipbookLayout.Grid2x2,
+    grid4x4 = Enum.ParticleFlipbookLayout.Grid4x4,
+    grid8x8 = Enum.ParticleFlipbookLayout.Grid8x8,
+}
+local flipbookModes = {
+    loop = Enum.ParticleFlipbookMode.Loop,
+    oneShot = Enum.ParticleFlipbookMode.OneShot,
+    pingPong = Enum.ParticleFlipbookMode.PingPong,
+    random = Enum.ParticleFlipbookMode.Random,
+}
+local textureModes = {
+    stretch = Enum.TextureMode.Stretch,
+    wrap = Enum.TextureMode.Wrap,
+    static = Enum.TextureMode.Static,
+}
+
 local function createParticle(node, parent)
     local part = anchorPart(node.name .. "_Anchor", node.position, node.rotation)
+    -- The emission volume is the anchor part's size, so a sphere emitter needs
+    -- a real part size rather than the default 0.1 stud marker.
+    part.Size = vector3(node.emitterSize, Vector3.new(0.1, 0.1, 0.1))
     setCommon(part, node)
     part.Parent = parent
     local attachment = Instance.new("Attachment")
@@ -219,7 +286,9 @@ local function createParticle(node, parent)
     attachment.Parent = part
     local emitter = Instance.new("ParticleEmitter")
     emitter.Name = node.name
-    emitter.Texture = node.texture or ""
+    if type(node.texture) == "string" and node.texture ~= "" then
+        emitter.Texture = node.texture
+    end
     emitter.Color = sequenceColor(node.color)
     emitter.Transparency = sequenceNumber(node.transparency, 0)
     emitter.Size = sequenceNumber(node.size, 1)
@@ -229,11 +298,26 @@ local function createParticle(node, parent)
     emitter.SpreadAngle = Vector2.new((node.spread and node.spread.x) or 0, (node.spread and node.spread.y) or 0)
     emitter.Acceleration = vector3(node.acceleration)
     emitter.Drag = node.drag or 0
+    emitter.Rotation = numberRange(node.rotationRange, 0)
     emitter.RotSpeed = numberRange(node.rotationSpeed, 0)
     emitter.LightEmission = node.lightEmission or 0
     emitter.LightInfluence = node.lightInfluence == nil and 1 or node.lightInfluence
     emitter.LockedToPart = node.lockedToPart == true
     emitter.ZOffset = node.zOffset or 0
+    emitter.Shape = particleShapes[node.emitterShape or "point"] or Enum.ParticleEmitterShape.Box
+    emitter.ShapeStyle = particleShapeStyles[node.shapeStyle or "volume"] or Enum.ParticleEmitterShapeStyle.Volume
+    emitter.ShapeInOut = particleShapeInOut[node.shapeInOut or "outward"] or Enum.ParticleEmitterShapeInOut.Outward
+    emitter.ShapePartial = node.shapePartial or 0
+    emitter.EmissionDirection = emissionDirections[node.emissionDirection or "top"] or Enum.NormalId.Top
+    emitter.Orientation = particleOrientations[node.orientation or "facingCamera"] or Enum.ParticleOrientation.FacingCamera
+    emitter.Squash = sequenceNumber(node.squash, 0)
+    pcall(function() emitter.TimeScale = node.timeScale == nil and 1 or node.timeScale end)
+    pcall(function() emitter.VelocityInheritance = node.velocityInheritance or 0 end)
+    pcall(function() emitter.WindAffectsDrag = node.windAffectsDrag == true end)
+    pcall(function() emitter.FlipbookLayout = flipbookLayouts[node.flipbookLayout or "none"] or Enum.ParticleFlipbookLayout.None end)
+    pcall(function() emitter.FlipbookMode = flipbookModes[node.flipbookMode or "loop"] or Enum.ParticleFlipbookMode.Loop end)
+    pcall(function() emitter.FlipbookFramerate = numberRange(node.flipbookFramerate, 1) end)
+    pcall(function() emitter.FlipbookStartRandom = node.flipbookStartRandom == true end)
     emitter.Enabled = (node.rate or 0) > 0
     emitter:SetAttribute("BurstCount", node.burstCount or 0)
     emitter.Parent = attachment
@@ -254,12 +338,18 @@ local function createBeam(node, parent)
     beam.Width0, beam.Width1 = node.width0 or 1, node.width1 or 1
     beam.Color = sequenceColor(node.color)
     beam.Transparency = sequenceNumber(node.transparency, 0)
-    beam.Texture = node.texture or ""
+    if type(node.texture) == "string" and node.texture ~= "" then
+        beam.Texture = node.texture
+    end
     beam.TextureSpeed = node.textureSpeed or 0
     beam.TextureLength = node.textureLength or 1
     beam.CurveSize0, beam.CurveSize1 = node.curve0 or 0, node.curve1 or 0
     beam.FaceCamera = node.faceCamera ~= false
     beam.Segments = node.segments or 10
+    beam.LightEmission = node.lightEmission or 0
+    beam.LightInfluence = node.lightInfluence == nil and 1 or node.lightInfluence
+    pcall(function() beam.TextureMode = textureModes[node.textureMode or "stretch"] or Enum.TextureMode.Stretch end)
+    pcall(function() beam.Brightness = node.brightness or 1 end)
     beam.Parent = p0
 end
 
@@ -281,6 +371,9 @@ local function createTrail(node, parent)
     trail.Texture = node.texture or ""
     trail.TextureLength = node.textureLength or 1
     trail.FaceCamera = node.faceCamera ~= false
+    trail.LightEmission = node.lightEmission or 0
+    trail.LightInfluence = node.lightInfluence == nil and 1 or node.lightInfluence
+    pcall(function() trail.Brightness = node.brightness or 1 end)
     trail.Enabled = false
     trail.Parent = part
 end
@@ -399,6 +492,51 @@ local function ensureFolder(parent, name)
     return folder
 end
 
+local function publishPackageMarkers(package, sourceName)
+    local bus = ensureFolder(ReplicatedStorage, "DirectorMarkerBus")
+    local folderName = "Visual_" .. sourceName
+    local existing = bus:FindFirstChild(folderName)
+    if existing then existing:Destroy() end
+    local channel = Instance.new("Folder")
+    channel.Name = folderName
+    channel:SetAttribute("SourceType", "Visual")
+    channel:SetAttribute("SourceName", sourceName)
+    channel:SetAttribute("Duration", package:GetAttribute("Duration") or 0)
+    channel.Parent = bus
+    local markers = package:FindFirstChild("Markers")
+    local count = 0
+    if markers then
+        for _, marker in markers:GetChildren() do
+            if marker:IsA("NumberValue") then
+                local clone = marker:Clone()
+                clone.Parent = channel
+                count += 1
+            end
+        end
+    end
+    channel:SetAttribute("MarkerCount", count)
+    return channel
+end
+
+local function listDirectorMarkers()
+    local bus = ReplicatedStorage:FindFirstChild("DirectorMarkerBus")
+    local channels = {}
+    if not bus then return { channels = channels, channelCount = 0, markerCount = 0 } end
+    local total = 0
+    for _, channel in bus:GetChildren() do
+        local markers = {}
+        for _, child in channel:GetChildren() do
+            if child:IsA("NumberValue") then
+                table.insert(markers, { id = child.Name, time = child.Value, type = child:GetAttribute("Type"), label = child:GetAttribute("Label") })
+            end
+        end
+        table.sort(markers, function(a, b) return a.time < b.time end)
+        total += #markers
+        table.insert(channels, { name = channel.Name, sourceType = channel:GetAttribute("SourceType"), sourceName = channel:GetAttribute("SourceName"), duration = channel:GetAttribute("Duration"), markers = markers })
+    end
+    return { channels = channels, channelCount = #channels, markerCount = total }
+end
+
 local function selectedTarget()
     local selected = Selection:Get()
     return selected[1]
@@ -436,19 +574,359 @@ local function buildPackage(draft, destinationName)
     return package
 end
 
+-- Reading a reference effect is only useful if it reports how the effect is
+-- actually built. Identity alone tells you nothing you can rebuild from.
+local function readNumberSequence(sequence)
+    local keys = {}
+    if typeof(sequence) ~= "NumberSequence" then return keys end
+    for _, keypoint in ipairs(sequence.Keypoints) do
+        table.insert(keys, { time = keypoint.Time, value = keypoint.Value, envelope = keypoint.Envelope })
+    end
+    return keys
+end
+
+local function readColorSequence(sequence)
+    local keys = {}
+    if typeof(sequence) ~= "ColorSequence" then return keys end
+    for _, keypoint in ipairs(sequence.Keypoints) do
+        local value = keypoint.Value
+        table.insert(keys, { time = keypoint.Time, color = { r = value.R, g = value.G, b = value.B } })
+    end
+    return keys
+end
+
+local function readRange(range)
+    if typeof(range) ~= "NumberRange" then return nil end
+    return { min = range.Min, max = range.Max }
+end
+
+local function readVector3(value)
+    if typeof(value) ~= "Vector3" then return nil end
+    return { x = value.X, y = value.Y, z = value.Z }
+end
+
+-- Properties differ across Studio versions, so every read is guarded and simply
+-- omitted when the running version does not expose it.
+local function optional(instance, property, transform)
+    local ok, value = pcall(function() return instance[property] end)
+    if not ok or value == nil then return nil end
+    if transform then return transform(value) end
+    if typeof(value) == "EnumItem" then return value.Name end
+    return value
+end
+
+local function describeEmitter(emitter)
+    local parent = emitter:FindFirstAncestorWhichIsA("BasePart")
+    return {
+        enabled = emitter.Enabled,
+        texture = emitter.Texture,
+        color = readColorSequence(emitter.Color),
+        size = readNumberSequence(emitter.Size),
+        transparency = readNumberSequence(emitter.Transparency),
+        lifetime = readRange(emitter.Lifetime),
+        speed = readRange(emitter.Speed),
+        rotSpeed = readRange(emitter.RotSpeed),
+        rotation = readRange(emitter.Rotation),
+        rate = emitter.Rate,
+        spreadAngle = { x = emitter.SpreadAngle.X, y = emitter.SpreadAngle.Y },
+        acceleration = readVector3(emitter.Acceleration),
+        drag = emitter.Drag,
+        lightEmission = emitter.LightEmission,
+        lightInfluence = emitter.LightInfluence,
+        lockedToPart = emitter.LockedToPart,
+        zOffset = emitter.ZOffset,
+        emissionDirection = optional(emitter, "EmissionDirection"),
+        shape = optional(emitter, "Shape"),
+        shapeStyle = optional(emitter, "ShapeStyle"),
+        shapeInOut = optional(emitter, "ShapeInOut"),
+        shapePartial = optional(emitter, "ShapePartial"),
+        orientation = optional(emitter, "Orientation"),
+        squash = optional(emitter, "Squash", readNumberSequence),
+        timeScale = optional(emitter, "TimeScale"),
+        windAffectsDrag = optional(emitter, "WindAffectsDrag"),
+        flipbookLayout = optional(emitter, "FlipbookLayout"),
+        flipbookMode = optional(emitter, "FlipbookMode"),
+        flipbookFramerate = optional(emitter, "FlipbookFramerate", readRange),
+        -- Shape emitters take their volume from the parent part's size.
+        emitterPartSize = parent and readVector3(parent.Size) or nil,
+        emitterPartName = parent and parent.Name or nil,
+    }
+end
+
+local function describeBeam(beam)
+    return {
+        enabled = beam.Enabled, texture = beam.Texture,
+        color = readColorSequence(beam.Color), transparency = readNumberSequence(beam.Transparency),
+        width0 = beam.Width0, width1 = beam.Width1,
+        curveSize0 = beam.CurveSize0, curveSize1 = beam.CurveSize1,
+        textureSpeed = beam.TextureSpeed, textureLength = beam.TextureLength,
+        textureMode = optional(beam, "TextureMode"),
+        faceCamera = beam.FaceCamera, segments = beam.Segments,
+        lightEmission = beam.LightEmission, lightInfluence = beam.LightInfluence,
+        zOffset = optional(beam, "ZOffset"),
+    }
+end
+
+local function describeTrail(trail)
+    return {
+        enabled = trail.Enabled, texture = trail.Texture,
+        color = readColorSequence(trail.Color), transparency = readNumberSequence(trail.Transparency),
+        widthScale = readNumberSequence(trail.WidthScale),
+        lifetime = trail.Lifetime, minLength = trail.MinLength,
+        textureLength = trail.TextureLength, textureMode = optional(trail, "TextureMode"),
+        faceCamera = trail.FaceCamera,
+        lightEmission = trail.LightEmission, lightInfluence = trail.LightInfluence,
+    }
+end
+
+local function describeLight(light)
+    return {
+        enabled = light.Enabled, brightness = light.Brightness, range = light.Range,
+        color = { r = light.Color.R, g = light.Color.G, b = light.Color.B },
+        shadows = light.Shadows, angle = optional(light, "Angle"),
+        face = optional(light, "Face"),
+    }
+end
+
 local function inspectInstance(root, maxResults)
     local items = {}
     for _, item in ipairs(root:GetDescendants()) do
         if #items >= maxResults then break end
         if item:IsA("ParticleEmitter") or item:IsA("Beam") or item:IsA("Trail") or item:IsA("Light") or item:IsA("GuiObject") or item:GetAttribute("VisualDirectorNodeId") then
-            table.insert(items, {
+            local entry = {
                 path = item:GetFullName(), name = item.Name, className = item.ClassName,
                 nodeId = item:GetAttribute("VisualDirectorNodeId"), kind = item:GetAttribute("VisualDirectorKind"),
                 startTime = item:GetAttribute("StartTime"), endTime = item:GetAttribute("EndTime"),
-            })
+            }
+            local ok, properties = pcall(function()
+                if item:IsA("ParticleEmitter") then return describeEmitter(item) end
+                if item:IsA("Beam") then return describeBeam(item) end
+                if item:IsA("Trail") then return describeTrail(item) end
+                if item:IsA("Light") then return describeLight(item) end
+                return nil
+            end)
+            if ok then entry.properties = properties end
+            table.insert(items, entry)
         end
     end
     return items
+end
+
+local inspectionSnapshots = {}
+local inspectionSnapshotOrder = {}
+
+local function storeInspectionSnapshot(target, items)
+    local id = HttpService:GenerateGUID(false)
+    inspectionSnapshots[id] = { target = target:GetFullName(), items = items, createdAt = os.clock() }
+    table.insert(inspectionSnapshotOrder, id)
+    while #inspectionSnapshotOrder > 12 do
+        local expired = table.remove(inspectionSnapshotOrder, 1)
+        inspectionSnapshots[expired] = nil
+    end
+    return id
+end
+
+local function inspectionSummary(items)
+    local classes, kinds, assets = {}, {}, {}
+    for _, item in ipairs(items) do
+        classes[item.className] = (classes[item.className] or 0) + 1
+        if item.kind then kinds[item.kind] = (kinds[item.kind] or 0) + 1 end
+        local properties = item.properties
+        if type(properties) == "table" then
+            for _, key in ipairs({ "texture", "image", "meshId", "soundId" }) do
+                local value = properties[key]
+                if type(value) == "string" and value ~= "" then assets[value] = true end
+            end
+        end
+    end
+    local assetList = {}
+    for value in assets do table.insert(assetList, value) end
+    table.sort(assetList)
+    return { classes = classes, kinds = kinds, uniqueAssets = assetList, uniqueAssetCount = #assetList }
+end
+
+local function inspectionPage(snapshot, page, pageSize, includeProperties)
+    local startIndex = (page - 1) * pageSize + 1
+    local finish = math.min(#snapshot.items, startIndex + pageSize - 1)
+    local items = {}
+    for index = startIndex, finish do
+        local source = snapshot.items[index]
+        if includeProperties then
+            table.insert(items, source)
+        else
+            table.insert(items, {
+                path = source.path, name = source.name, className = source.className,
+                nodeId = source.nodeId, kind = source.kind, startTime = source.startTime, endTime = source.endTime,
+            })
+        end
+    end
+    return {
+        snapshotId = snapshot.id, target = snapshot.target, page = page, pageSize = pageSize,
+        total = #snapshot.items, pageCount = math.max(1, math.ceil(#snapshot.items / pageSize)), items = items,
+    }
+end
+
+-- Property-complete operational editing. This deliberately exposes writable
+-- Roblox properties instead of a lossy approximation, while keeping the
+-- target inside the selected/committed VFX subtree and forbidding code.
+local writableProperties = {
+    ParticleEmitter = {
+        Acceleration = true, Color = true, Drag = true, EmissionDirection = true, Enabled = true,
+        FlipbookFramerate = true, FlipbookLayout = true, FlipbookMode = true, FlipbookStartRandom = true,
+        Lifetime = true, LightEmission = true, LightInfluence = true, LockedToPart = true,
+        Orientation = true, Rate = true, Rotation = true, RotSpeed = true, Shape = true,
+        ShapeInOut = true, ShapePartial = true, ShapeStyle = true, Size = true, Speed = true,
+        SpreadAngle = true, Squash = true, Texture = true, TimeScale = true, Transparency = true,
+        VelocityInheritance = true, WindAffectsDrag = true, ZOffset = true,
+    },
+    Beam = {
+        Attachment0 = true, Attachment1 = true, Brightness = true, Color = true, CurveSize0 = true,
+        CurveSize1 = true, Enabled = true, FaceCamera = true, LightEmission = true, LightInfluence = true,
+        Segments = true, Texture = true, TextureLength = true, TextureMode = true, TextureSpeed = true,
+        Transparency = true, Width0 = true, Width1 = true, ZOffset = true,
+    },
+    Trail = {
+        Attachment0 = true, Attachment1 = true, Brightness = true, Color = true, Enabled = true,
+        FaceCamera = true, Lifetime = true, LightEmission = true, LightInfluence = true,
+        MaxLength = true, MinLength = true, Texture = true, TextureLength = true, TextureMode = true,
+        Transparency = true, WidthScale = true,
+    },
+    Attachment = { CFrame = true, Position = true, Orientation = true, Axis = true, SecondaryAxis = true, Visible = true },
+    BasePart = { CFrame = true, Size = true, Color = true, Material = true, Transparency = true, Reflectance = true },
+    Light = { Brightness = true, Color = true, Enabled = true, Range = true, Shadows = true },
+    PointLight = { Brightness = true, Color = true, Enabled = true, Range = true, Shadows = true },
+    SpotLight = { Angle = true, Brightness = true, Color = true, Enabled = true, Face = true, Range = true, Shadows = true },
+    SurfaceLight = { Angle = true, Brightness = true, Color = true, Enabled = true, Face = true, Range = true, Shadows = true },
+    GuiObject = { AnchorPoint = true, BackgroundColor3 = true, BackgroundTransparency = true, Position = true, Rotation = true, Size = true, Visible = true, ZIndex = true },
+}
+
+local function canWriteProperty(instance, property)
+    local exact = writableProperties[instance.ClassName]
+    if exact and exact[property] then return true end
+    for className, properties in pairs(writableProperties) do
+        if instance:IsA(className) and properties[property] then return true end
+    end
+    return false
+end
+
+local function typedValue(spec)
+    if type(spec) ~= "table" then error("Property values must be typed objects.") end
+    local kind = spec.type
+    if kind == "number" or kind == "boolean" or kind == "string" then return spec.value end
+    if kind == "color3" then return color(spec.value) end
+    if kind == "vector2" then return Vector2.new(spec.value.x or 0, spec.value.y or 0) end
+    if kind == "vector3" then return vector3(spec.value) end
+    if kind == "numberRange" then return numberRange(spec.value, 0) end
+    if kind == "numberSequence" then return sequenceNumber(spec.value, 0) end
+    if kind == "colorSequence" then return sequenceColor(spec.value) end
+    if kind == "enum" then
+        local enumType = Enum[spec.enumType]
+        local item = enumType and enumType[spec.value]
+        if not item then error("Unknown enum value " .. tostring(spec.enumType) .. "." .. tostring(spec.value)) end
+        return item
+    end
+    if kind == "cframe" then
+        local position = vector3(spec.position)
+        local rotation = vector3(spec.rotationDegrees)
+        return CFrame.new(position) * CFrame.Angles(math.rad(rotation.X), math.rad(rotation.Y), math.rad(rotation.Z))
+    end
+    error("Unsupported typed property value: " .. tostring(kind))
+end
+
+local function selectorMatches(instance, root, selector)
+    if instance == root and selector.includeRoot ~= true then return false end
+    if selector.name and instance.Name ~= selector.name then return false end
+    if selector.className and instance.ClassName ~= selector.className and not instance:IsA(selector.className) then return false end
+    if selector.nodeId and instance:GetAttribute("VisualDirectorNodeId") ~= selector.nodeId then return false end
+    if selector.pathContains and not string.find(instance:GetFullName(), selector.pathContains, 1, true) then return false end
+    return true
+end
+
+local function selectInstances(root, selector)
+    local matches = {}
+    if selectorMatches(root, root, selector) then table.insert(matches, root) end
+    for _, instance in ipairs(root:GetDescendants()) do
+        if selectorMatches(instance, root, selector) then table.insert(matches, instance) end
+    end
+    return matches
+end
+
+local function packageRoot(packageName)
+    local root = ReplicatedStorage:FindFirstChild("VisualDirectorVFX")
+    local package = root and root:FindFirstChild(packageName)
+    if not package then error("Committed VFX package not found: " .. tostring(packageName)) end
+    return package
+end
+
+local function operationRoot(program)
+    if program.scope == "committedPackage" then return packageRoot(program.packageName) end
+    local target = selectedTarget()
+    if not target then error("Select a VFX root before applying operations.") end
+    if program.scope == "attachedPackage" then
+        local root = target:FindFirstChild("VisualDirectorVFX")
+        local package = root and root:FindFirstChild(program.packageName)
+        if not package then error("Attached VFX package not found under selection: " .. tostring(program.packageName)) end
+        return package
+    end
+    return target
+end
+
+local function attributeValue(value)
+    if type(value) ~= "table" then return value end
+    if value.r ~= nil then return color(value) end
+    if value.z ~= nil then return vector3(value) end
+    if value.x ~= nil then return Vector2.new(value.x or 0, value.y or 0) end
+    error("Unsupported attribute value object.")
+end
+
+local function applyOperationProgram(program)
+    local root = operationRoot(program)
+    local affected = 0
+    for index, operation in ipairs(program.operations or {}) do
+        local matches = selectInstances(root, operation.selector or {})
+        if #matches == 0 and operation.requireMatch ~= false then
+            error("Operation " .. tostring(index) .. " (" .. tostring(operation.op) .. ") matched nothing.")
+        end
+        if operation.op == "setProperty" then
+            local value = typedValue(operation.value)
+            for _, instance in ipairs(matches) do
+                if not canWriteProperty(instance, operation.property) then
+                    error(instance.ClassName .. "." .. tostring(operation.property) .. " is not writable through Visual Director.")
+                end
+                local ok, message = pcall(function() instance[operation.property] = value end)
+                if not ok then error("Could not set " .. instance:GetFullName() .. "." .. operation.property .. ": " .. tostring(message)) end
+                affected += 1
+            end
+        elseif operation.op == "setAttribute" then
+            for _, instance in ipairs(matches) do instance:SetAttribute(operation.attribute, attributeValue(operation.value)); affected += 1 end
+        elseif operation.op == "rename" then
+            for _, instance in ipairs(matches) do instance.Name = operation.name; affected += 1 end
+        elseif operation.op == "emit" then
+            for _, instance in ipairs(matches) do
+                if not instance:IsA("ParticleEmitter") then error("emit only accepts ParticleEmitter targets.") end
+                instance:Emit(operation.count)
+                affected += 1
+            end
+        elseif operation.op == "destroy" then
+            for _, instance in ipairs(matches) do
+                if instance == root then error("The operation root cannot be destroyed.") end
+                instance:Destroy(); affected += 1
+            end
+        elseif operation.op == "clone" then
+            local parents = operation.parentSelector and selectInstances(root, operation.parentSelector) or {}
+            local parent = parents[1]
+            if operation.parentSelector and not parent then error("clone parentSelector matched nothing.") end
+            for _, instance in ipairs(matches) do
+                local clone = instance:Clone()
+                if operation.name then clone.Name = operation.name end
+                clone.Parent = parent or instance.Parent
+                affected += 1
+            end
+        else
+            error("Unsupported VFX operation: " .. tostring(operation.op))
+        end
+    end
+    return root, affected
 end
 
 local handlers = {}
@@ -458,6 +936,12 @@ handlers["system.capabilities"] = function()
         supportedNodes = { "particle", "beam", "trail", "geometry", "light", "screen", "camera", "sound" },
         supportedCategories = { "attack", "impactFrame", "hud", "environment", "characterAura", "cinematic", "custom" },
         maxNodes = 500, maxDuration = 120, transactionalCommit = true, selectionAttachment = true,
+        exactNativeCapture = true, boundedPropertyOperations = true, partialEditing = true,
+        paginatedInspectionSnapshots = true, deterministicTimelinePlayback = true,
+        propertyCurveTimeline = true, vfxBudgetProfiler = true,
+        proceduralModuleCompiler = true, directorMarkerBus = true, reusableModuleLibrary = true,
+        operationScopes = { "selection", "committedPackage", "attachedPackage" },
+        operationTypes = { "setProperty", "setAttribute", "clone", "destroy", "rename", "emit" },
         arbitraryCodeExecution = false,
     }
 end
@@ -473,8 +957,167 @@ end
 handlers["vfx.inspectSelected"] = function(params)
     local target = selectedTarget()
     if not target then error("Select a target before inspecting VFX.") end
-    local items = inspectInstance(target, math.clamp(params.maxResults or 300, 1, 1000))
-    return { target = target:GetFullName(), count = #items, items = items }
+    local items = inspectInstance(target, math.clamp(params.maxResults or 3000, 1, 5000))
+    local snapshotId = storeInspectionSnapshot(target, items)
+    local snapshot = inspectionSnapshots[snapshotId]
+    snapshot.id = snapshotId
+    local pageSize = math.clamp(params.pageSize or 25, 1, 100)
+    local detail = params.detail or "summary"
+    local result = inspectionPage(snapshot, math.max(1, params.page or 1), pageSize, detail == "full")
+    result.summary = inspectionSummary(items)
+    if detail == "summary" then result.items = {} end
+    return result
+end
+
+handlers["vfx.inspectSnapshotPage"] = function(params)
+    local snapshot = inspectionSnapshots[params.snapshotId]
+    if not snapshot then error("Unknown or expired VFX inspection snapshot: " .. tostring(params.snapshotId)) end
+    snapshot.id = params.snapshotId
+    return inspectionPage(snapshot, math.max(1, params.page or 1), math.clamp(params.pageSize or 25, 1, 100), params.includeProperties ~= false)
+end
+
+handlers["vfx.profileSelected"] = function(_params)
+    local target = selectedTarget()
+    if not target then error("Select a VFX hierarchy before profiling.") end
+    local stats = {
+        emitters = 0, continuousEmitters = 0, estimatedLiveParticles = 0, emissionRate = 0,
+        burstParticles = 0, particleOverdrawProxy = 0, beams = 0, beamSegments = 0,
+        trails = 0, lights = 0, shadowedLights = 0, transparentParts = 0, uniqueTextures = 0,
+    }
+    local textures, warnings = {}, {}
+    for _, item in ipairs(target:GetDescendants()) do
+        if item:IsA("ParticleEmitter") then
+            stats.emitters += 1
+            stats.emissionRate += item.Rate
+            if item.Enabled and item.Rate > 0 then stats.continuousEmitters += 1 end
+            local live = item.Rate * item.Lifetime.Max
+            stats.estimatedLiveParticles += live
+            local maximumSize = 0
+            for _, key in ipairs(item.Size.Keypoints) do maximumSize = math.max(maximumSize, key.Value + key.Envelope) end
+            stats.particleOverdrawProxy += live * maximumSize * maximumSize
+            local burst = item:GetAttribute("BurstCount")
+            if type(burst) == "number" then stats.burstParticles += burst end
+            if item.Texture ~= "" then textures[item.Texture] = true end
+        elseif item:IsA("Beam") then
+            stats.beams += 1; stats.beamSegments += item.Segments
+            if item.Texture ~= "" then textures[item.Texture] = true end
+        elseif item:IsA("Trail") then
+            stats.trails += 1
+            if item.Texture ~= "" then textures[item.Texture] = true end
+        elseif item:IsA("Light") then
+            stats.lights += 1
+            if item.Shadows then stats.shadowedLights += 1 end
+        elseif item:IsA("BasePart") and item.Transparency > 0 and item.Transparency < 1 then
+            stats.transparentParts += 1
+        end
+    end
+    for _ in textures do stats.uniqueTextures += 1 end
+    if stats.estimatedLiveParticles > 800 then table.insert(warnings, "Estimated simultaneous particle count is high for mobile.") end
+    if stats.particleOverdrawProxy > 12000 then table.insert(warnings, "Particle size/lifetime/rate combination has a high overdraw proxy.") end
+    if stats.shadowedLights > 2 then table.insert(warnings, "More than two shadowed VFX lights can be disproportionately expensive.") end
+    if stats.beamSegments > 600 then table.insert(warnings, "Total Beam segments are high; reserve them for silhouette-critical arcs.") end
+    if stats.continuousEmitters > 20 then table.insert(warnings, "Many continuous emitters are active; prefer timed bursts or pooled modules.") end
+    local mobilePenalty = math.min(1, stats.estimatedLiveParticles / 1200) * 0.35
+        + math.min(1, stats.particleOverdrawProxy / 18000) * 0.35
+        + math.min(1, stats.shadowedLights / 4) * 0.2
+        + math.min(1, stats.beamSegments / 1000) * 0.1
+    local desktopPenalty = math.min(1, stats.estimatedLiveParticles / 4000) * 0.35
+        + math.min(1, stats.particleOverdrawProxy / 60000) * 0.35
+        + math.min(1, stats.shadowedLights / 10) * 0.2
+        + math.min(1, stats.beamSegments / 3000) * 0.1
+    return {
+        target = target:GetFullName(), stats = stats, warnings = warnings,
+        budgets = {
+            mobile = { score = math.max(0, 1 - mobilePenalty), status = mobilePenalty < 0.35 and "healthy" or mobilePenalty < 0.65 and "watch" or "heavy" },
+            desktop = { score = math.max(0, 1 - desktopPenalty), status = desktopPenalty < 0.35 and "healthy" or desktopPenalty < 0.65 and "watch" or "heavy" },
+        },
+        note = "This is a deterministic complexity/overdraw proxy, not a GPU frame-time measurement.",
+    }
+end
+
+handlers["vfx.captureSelection"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select the native VFX root to capture.") end
+    if type(params.packageName) ~= "string" or params.packageName == "" then error("packageName is required.") end
+    local clone = target:Clone()
+    local committedRoot = ensureFolder(ReplicatedStorage, "VisualDirectorVFX")
+    local existing = committedRoot:FindFirstChild(params.packageName)
+    if existing and (existing == target or target:IsDescendantOf(existing)) then
+        error("Select the source VFX in Workspace, not the committed destination being replaced.")
+    end
+    ChangeHistoryService:SetWaypoint("Before Visual Director exact capture")
+    if existing then existing:Destroy() end
+    local package = Instance.new("Folder")
+    package.Name = params.packageName
+    package:SetAttribute("VisualDirectorPackage", true)
+    package:SetAttribute("CapturedNative", true)
+    package:SetAttribute("CapturedFrom", target:GetFullName())
+    package:SetAttribute("Duration", params.duration or 1)
+    clone.Name = "CapturedRoot"
+    clone.Parent = package
+    package.Parent = committedRoot
+    ChangeHistoryService:SetWaypoint("Capture native VFX " .. params.packageName)
+    return { status = "captured", packageName = package.Name, path = package:GetFullName(), source = target:GetFullName(), descendantCount = #clone:GetDescendants() }
+end
+
+handlers["vfx.saveSelectionAsModule"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select a VFX hierarchy before saving a module.") end
+    if type(params.moduleName) ~= "string" or params.moduleName == "" then error("moduleName is required.") end
+    ChangeHistoryService:SetWaypoint("Before Visual Director module save")
+    local library = ensureFolder(ServerStorage, "VisualDirectorModules")
+    local existing = library:FindFirstChild(params.moduleName)
+    if existing then existing:Destroy() end
+    local module = target:Clone()
+    module.Name = params.moduleName
+    module:SetAttribute("VisualDirectorModule", true)
+    module:SetAttribute("Description", params.description or "")
+    module:SetAttribute("Tags", HttpService:JSONEncode(params.tags or {}))
+    module:SetAttribute("CreatedAt", os.time())
+    for _, descendant in module:GetDescendants() do
+        if descendant:IsA("LuaSourceContainer") then descendant:Destroy() end
+    end
+    module.Parent = library
+    ChangeHistoryService:SetWaypoint("Save Visual Director module " .. params.moduleName)
+    return { status = "saved", moduleName = module.Name, path = module:GetFullName(), descendantCount = #module:GetDescendants() }
+end
+
+handlers["vfx.listModules"] = function(_params)
+    local library = ServerStorage:FindFirstChild("VisualDirectorModules")
+    local modules = {}
+    if library then
+        for _, module in library:GetChildren() do
+            local tags = {}
+            local encoded = module:GetAttribute("Tags")
+            if type(encoded) == "string" then pcall(function() tags = HttpService:JSONDecode(encoded) end) end
+            table.insert(modules, { name = module.Name, className = module.ClassName, description = module:GetAttribute("Description"), tags = tags, descendantCount = #module:GetDescendants() })
+        end
+    end
+    table.sort(modules, function(a, b) return a.name < b.name end)
+    return { modules = modules, count = #modules }
+end
+
+handlers["vfx.instantiateModule"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select a destination before instantiating a VFX module.") end
+    local library = ServerStorage:FindFirstChild("VisualDirectorModules")
+    local source = library and library:FindFirstChild(params.moduleName)
+    if not source then error("Unknown Visual Director module: " .. tostring(params.moduleName)) end
+    ChangeHistoryService:SetWaypoint("Before Visual Director module instance")
+    local clone = source:Clone()
+    clone.Name = params.instanceName or params.moduleName
+    clone:SetAttribute("VisualDirectorModuleInstance", params.moduleName)
+    clone.Parent = target
+    ChangeHistoryService:SetWaypoint("Instantiate Visual Director module " .. params.moduleName)
+    return { status = "instantiated", moduleName = params.moduleName, path = clone:GetFullName(), descendantCount = #clone:GetDescendants() }
+end
+
+handlers["vfx.applyOperations"] = function(params)
+    if type(params.program) ~= "table" then error("A complete operation program is required.") end
+    ChangeHistoryService:SetWaypoint("Before Visual Director operations")
+    local root, affected = applyOperationProgram(params.program)
+    ChangeHistoryService:SetWaypoint("Apply Visual Director operations " .. tostring(params.program.name or "unnamed"))
+    return { status = "applied", programName = params.program.name, root = root:GetFullName(), affected = affected, operationCount = #(params.program.operations or {}) }
 end
 
 handlers["vfx.stageDraft"] = function(params)
@@ -500,9 +1143,14 @@ handlers["vfx.commitDraft"] = function(params)
     ChangeHistoryService:SetWaypoint("Before Visual Director commit")
     local draft = HttpService:JSONDecode(staged.Value)
     local package = buildPackage(draft, destinationName)
+    publishPackageMarkers(package, destinationName)
     staged:Destroy()
     ChangeHistoryService:SetWaypoint("Commit Visual Director package " .. destinationName)
     return { status = "committed", packageName = package.Name, path = package:GetFullName(), nodeCount = #(draft.nodes or {}), duration = draft.duration }
+end
+
+handlers["timeline.listMarkers"] = function(_params)
+    return listDirectorMarkers()
 end
 
 local function targetPivot(target)
@@ -512,12 +1160,33 @@ local function targetPivot(target)
     return model and model:GetPivot() or CFrame.identity
 end
 
+local function targetBasePart(target)
+    if target:IsA("BasePart") then return target end
+    if target:IsA("Attachment") or target:IsA("Bone") then
+        return target:FindFirstAncestorWhichIsA("BasePart")
+    end
+    if target:IsA("Model") then
+        return target.PrimaryPart or target:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return target:FindFirstAncestorWhichIsA("BasePart")
+end
+
 local function placeCloneAtTarget(clone, target)
     local pivot = targetPivot(target)
+    local followPart = targetBasePart(target)
     for _, item in ipairs(clone:GetDescendants()) do
         if item:IsA("BasePart") then
             local localCFrame = item:GetAttribute("VisualDirectorLocalCFrame")
             if typeof(localCFrame) == "CFrame" then item.CFrame = pivot * localCFrame end
+            if followPart then
+                item.Anchored = false
+                item.Massless = true
+                local weld = Instance.new("WeldConstraint")
+                weld.Name = "VisualDirectorFollowTarget"
+                weld.Part0 = followPart
+                weld.Part1 = item
+                weld.Parent = item
+            end
         end
     end
 end
@@ -530,9 +1199,15 @@ handlers["vfx.attachCommitted"] = function(params)
     if not source then error("Committed VFX package not found: " .. tostring(params.packageName)) end
     ChangeHistoryService:SetWaypoint("Before Visual Director attach")
     local destination = ensureFolder(target, "VisualDirectorVFX")
+    -- With ReplicatedStorage selected, destination IS the committed root, so
+    -- `old` and `source` are the same instance and the old code destroyed the
+    -- package before cloning it. Refuse, and otherwise clone before destroying.
+    if destination == committedRoot then
+        error("Select the rig or part to attach to, not ReplicatedStorage: that would destroy the committed package.")
+    end
+    local clone = source:Clone()
     local old = destination:FindFirstChild(source.Name)
     if old then old:Destroy() end
-    local clone = source:Clone()
     clone:SetAttribute("AttachedTarget", target:GetFullName())
     clone.Parent = destination
     placeCloneAtTarget(clone, target)
@@ -541,18 +1216,71 @@ handlers["vfx.attachCommitted"] = function(params)
 end
 
 local function setPreviewState(root, time)
-    for _, item in ipairs(root:GetDescendants()) do
-        local startTime, endTime = item:GetAttribute("StartTime"), item:GetAttribute("EndTime")
+    for _, nodeRoot in ipairs(root:GetDescendants()) do
+        local startTime, endTime = nodeRoot:GetAttribute("StartTime"), nodeRoot:GetAttribute("EndTime")
         if type(startTime) == "number" and type(endTime) == "number" then
             local active = time >= startTime and time <= endTime
-            if item:IsA("ParticleEmitter") then
-                item.Enabled = active and item.Rate > 0
-                if active then local burst = item:GetAttribute("BurstCount"); if type(burst) == "number" and burst > 0 then item:Emit(burst) end end
-            elseif item:IsA("Beam") or item:IsA("Trail") or item:IsA("Light") then item.Enabled = active
-            elseif item:IsA("GuiObject") then item.Visible = active
-            elseif item:IsA("BasePart") and item:GetAttribute("VisualDirectorKind") == "geometry" then item.Transparency = active and (item:GetAttribute("StartTransparency") or item.Transparency) or 1 end
+            if nodeRoot:IsA("GuiObject") then nodeRoot.Visible = active end
+            if nodeRoot:IsA("BasePart") and nodeRoot:GetAttribute("VisualDirectorKind") == "geometry" then
+                nodeRoot.Transparency = active and (nodeRoot:GetAttribute("StartTransparency") or nodeRoot.Transparency) or 1
+            end
+            for _, item in ipairs(nodeRoot:GetDescendants()) do
+                if item:IsA("ParticleEmitter") then
+                    item.Enabled = active and item.Rate > 0
+                    if active then local burst = item:GetAttribute("BurstCount"); if type(burst) == "number" and burst > 0 then item:Emit(burst) end end
+                elseif item:IsA("Beam") or item:IsA("Trail") or item:IsA("Light") then
+                    item.Enabled = active
+                end
+            end
         end
     end
+end
+
+handlers["vfx.smokeRuntime"] = function(_params)
+    local root = Instance.new("Folder")
+    root.Name = "VisualDirectorRuntimeSmoke"
+    root:SetAttribute("Duration", 1)
+    root.Parent = workspace
+    local part = Instance.new("Part")
+    part.Name = "RuntimeGeometry"
+    part.Anchored = true
+    part.CanCollide = false
+    part.Size = Vector3.new(2, 2, 2)
+    part.Transparency = 0
+    part:SetAttribute("StartTime", 0)
+    part:SetAttribute("EndTime", 1)
+    part:SetAttribute("VisualDirectorKind", "geometry")
+    part:SetAttribute("EnabledByDraft", true)
+    part:SetAttribute("StartScale", Vector3.new(1, 1, 1))
+    part:SetAttribute("EndScale", Vector3.new(2, 2, 2))
+    part:SetAttribute("StartTransparency", 0)
+    part:SetAttribute("EndTransparency", 1)
+    part:SetAttribute("Easing", "linear")
+    part:SetAttribute("VisualDirectorPropertyCurves", HttpService:JSONEncode({ {
+        target = "particle", property = "Rate", interpolation = "linear",
+        keys = { { time = 0, value = 12 }, { time = 1, value = 24 } },
+    } }))
+    part.Parent = root
+    local emitter = Instance.new("ParticleEmitter")
+    emitter.Rate = 12
+    emitter.Enabled = false
+    emitter.Parent = part
+    local playback = VisualDirectorRuntime.play(root, { speed = 1, loop = false, applyCameraEffects = false })
+    playback:setTime(0.5)
+    local during = {
+        size = part.Size, transparency = part.Transparency,
+        emitterEnabled = emitter.Enabled, emitterRate = emitter.Rate,
+    }
+    playback:stop()
+    local restored = { size = part.Size, transparency = part.Transparency, emitterEnabled = emitter.Enabled }
+    root:Destroy()
+    local passed = (during.size - Vector3.new(3, 3, 3)).Magnitude < 0.001
+        and math.abs(during.transparency - 0.5) < 0.001
+        and during.emitterEnabled == true
+        and math.abs(during.emitterRate - 18) < 0.001
+        and (restored.size - Vector3.new(2, 2, 2)).Magnitude < 0.001
+        and restored.emitterEnabled == false
+    return { status = if passed then "passed" else "failed", passed = passed, during = during, restored = restored }
 end
 
 handlers["vfx.previewCommitted"] = function(params)
@@ -575,6 +1303,42 @@ handlers["vfx.previewCommitted"] = function(params)
     setPreviewState(clone, normalized * duration)
     Selection:Set({ target })
     return { status = "previewed", packageName = source.Name, target = target:GetFullName(), normalizedTime = normalized, previewPath = preview:GetFullName() }
+end
+
+handlers["vfx.playCommittedTimeline"] = function(params)
+    local target = selectedTarget()
+    if not target then error("Select a timeline preview target.") end
+    local committedRoot = ReplicatedStorage:FindFirstChild("VisualDirectorVFX")
+    local source = committedRoot and committedRoot:FindFirstChild(params.packageName)
+    if not source then error("Committed VFX package not found: " .. tostring(params.packageName)) end
+    if activeTimelinePlayback then pcall(function() activeTimelinePlayback:stop() end); activeTimelinePlayback = nil end
+    local previous = workspace:FindFirstChild("VisualDirectorPreview")
+    if previous then previous:Destroy() end
+    local preview = Instance.new("Folder")
+    preview.Name = "VisualDirectorPreview"
+    preview:SetAttribute("VisualDirectorPreview", true)
+    preview.Parent = workspace
+    local clone = source:Clone()
+    clone.Parent = preview
+    placeCloneAtTarget(clone, target)
+    activeTimelinePlayback = VisualDirectorRuntime.play(clone, {
+        speed = math.clamp(params.playbackSpeed or 1, 0.05, 4),
+        loop = params.looped == true,
+        applyCameraEffects = params.applyCameraEffects == true,
+    })
+    Selection:Set({ target })
+    return {
+        status = "playing-timeline", packageName = source.Name, target = target:GetFullName(),
+        playbackSpeed = params.playbackSpeed or 1, looped = params.looped == true,
+        previewPath = preview:GetFullName(),
+    }
+end
+
+handlers["vfx.stopTimelinePreview"] = function(_params)
+    if activeTimelinePlayback then pcall(function() activeTimelinePlayback:stop() end); activeTimelinePlayback = nil end
+    local preview = workspace:FindFirstChild("VisualDirectorPreview")
+    if preview then preview:Destroy() end
+    return { status = "stopped" }
 end
 
 local function executeCommand(command)
@@ -617,7 +1381,14 @@ local function pollOnce()
         path, payload = "/v1/plugin/poll", { installationId = installationId, launchId = launchId, pairingCode = pairingCode, token = token }
     end
     local response = request("POST", path, payload)
-    if response.reconnect then connected = false; return end
+    -- The bridge no longer knows this session, usually because a new MCP
+    -- process took the port. Drop the session and let the loop re-register.
+    if response.reconnect then
+        connected = false
+        sessionId = nil
+        setStatus("Sessao expirou, reconectando...", false)
+        return
+    end
     local command = response.command
     if not command then return end
     local ok, result = pcall(executeCommand, command)
@@ -636,8 +1407,24 @@ local function pollOnce()
 end
 
 connectButton.MouseButton1Click:Connect(function()
+    local candidate = trimUrl(relayBox.Text)
+    local candidateIsLocal = string.find(candidate, "127.0.0.1", 1, true) ~= nil or string.find(candidate, "localhost", 1, true) ~= nil
+    if not candidateIsLocal and not remoteConsentAccepted and not disclosureArmed then
+        disclosureArmed = true
+        connectButton.Text = "Confirmar envio"
+        setStatus("Modo remoto envia installationId, Roblox user/creator id, placeId, placeName e versao do plugin ao relay a cada polling. Clique novamente para consentir uma unica vez.", false)
+        return
+    end
+    if not candidateIsLocal and not remoteConsentAccepted then
+        remoteConsentAccepted = true
+        plugin:SetSetting(SETTINGS.remoteConsent, true)
+    end
+    disclosureArmed = false
+    connectButton.Text = "Reconectar"
     connectButton.Active = false
     setStatus("Conectando...", false)
+    shouldConnect = true
+    nextRetryClock = 0
     local ok, err = pcall(connect)
     if not ok then connected = false; setStatus("Falha: " .. tostring(err), false) end
     connectButton.Active = true
@@ -647,10 +1434,21 @@ task.spawn(function()
     while running do
         if connected then
             local ok, err = pcall(pollOnce)
-            if not ok then connected = false; setStatus("Desconectado: " .. tostring(err), false) end
+            if not ok then connected = false; setStatus("Reconectando: " .. tostring(err), false) end
+        elseif shouldConnect and os.clock() >= nextRetryClock then
+            local ok, err = pcall(connect)
+            if not ok then
+                -- Back off so a bridge that is genuinely down is not hammered
+                -- once per frame while the user is doing something else.
+                nextRetryClock = os.clock() + 2
+                setStatus("Reconectando... " .. tostring(err), false)
+            end
         end
-        task.wait(connected and 0.5 or 1.2)
+        task.wait(connected and 0.5 or 0.6)
     end
 end)
 
-plugin.Unloading:Connect(function() running = false end)
+plugin.Unloading:Connect(function()
+    running = false
+    if activeTimelinePlayback then pcall(function() activeTimelinePlayback:stop() end) end
+end)

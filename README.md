@@ -9,16 +9,17 @@ Visual Director is a local-first AI authoring system for Roblox VFX. It follows 
 - sound cues synchronized to visual markers;
 - safe staging, validation, commit, attach and edit-time preview.
 
-The AI never sends executable Luau. It sends a complete declarative `VfxDraft`; the plugin validates the supported fields and creates Roblox instances itself.
+The AI never sends executable Luau. It can author a declarative `VfxDraft`, capture an existing native hierarchy without losing properties, or apply bounded property-complete operations to a selected/committed package.
 
 ## Current version
 
-`v0.1.0` is an MVP for development and controlled testing. It is not a public Marketplace release yet. The data contract and transactional Studio flow are implemented; runtime playback helpers, asset upload workflows and visual human review still need iteration.
+`v0.4.0` is a development release. It adds exact native capture, deterministic property-curve playback, paginated snapshots, profiling, compact element-aware procedural modules, reusable native modules, stored draft IDs, a shared marker bus, and connected spatial acceleration/drag field graphs. It is not a public Marketplace release yet; automated viewport image review still needs iteration.
 
 ## Repository layout
 
 - `src/domain.ts` — complete VFX draft schema.
 - `src/quality.ts` — structural, timing and layering review.
+- `src/operations.ts` — safe property-complete partial-edit schema.
 - `src/bridge.ts` — local MCP-to-Studio bridge on port `34728`.
 - `src/web-relay.ts` — HTTPS relay used by a Custom GPT.
 - `src/index.ts` — local MCP server.
@@ -62,14 +63,14 @@ No OpenAI or Roblox API key is required for pairing. The random plugin token aut
 
 1. Read capabilities and current selection.
 2. Inspect existing VFX when using references.
-3. Author one complete `VfxDraft` with explicit palette, timing markers and nodes.
+3. For a professional native reference, capture it exactly and refine it with an operation program. For a new effect, author a complete `VfxDraft`.
 4. Validate it.
 5. Stage it with a transaction name.
 6. Commit the transaction into `ReplicatedStorage.VisualDirectorVFX`.
 7. Attach it to the selected target when requested.
 8. Preview important times and ask for human visual review.
 
-Committed packages retain the complete source draft in attributes, so later tools can reconstruct and refine the effect rather than treating it as an opaque folder.
+Committed drafts retain their source in attributes. Exact captures preserve the complete native instance hierarchy, including properties not represented by a draft.
 
 ## Security boundary
 

@@ -1,6 +1,6 @@
 {
   "name": "roblox-visual-director",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Local-first AI VFX, impact-frame and HUD authoring for Roblox Studio",
   "type": "module",
@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --import tsx test/**/*.test.ts",
+    "smoke:runtime": "tsx scripts/smoke-runtime.ts",
     "dev": "tsx src/index.ts",
     "relay:dev": "tsx src/web-relay-main.ts",
     "start": "node dist/src/index.js",

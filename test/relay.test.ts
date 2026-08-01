@@ -41,6 +41,33 @@ test("serves a GPT-importable OpenAPI document", async () => {
     assert.equal(document.openapi, "3.1.0");
     assert.ok(document.components.schemas.VfxDraft.properties.nodes);
     assert.ok(document.paths["/v1/vfx/stage"].post.operationId);
+    assert.equal(document.paths["/v1/vfx/generate"].post.operationId, "generateProceduralVfxModule");
+    assert.equal(document.paths["/v1/vfx/modules/instantiate"].post.operationId, "instantiateVfxModule");
+    assert.equal(document.paths["/v1/vfx/graph/compile"].post.operationId, "compileVfxNodeGraph");
+    assert.equal(document.paths["/v1/vfx/runtime-smoke"].post.operationId, "smokeVisualRuntime");
+  } finally {
+    await relay.stop();
+  }
+});
+
+test("stores a compact procedural draft and stages it by draftId", async () => {
+  const draftPort = port + 2;
+  const relay = new VisualDirectorRelay("127.0.0.1", draftPort);
+  await relay.start();
+  try {
+    const auth = { installationId: "installation-module", launchId: "launch-module", pairingCode: "MODUL-12345", token: "module-token" };
+    await fetch(`http://127.0.0.1:${draftPort}/v1/plugin/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(auth) });
+    const generatedResponse = await fetch(`http://127.0.0.1:${draftPort}/v1/vfx/generate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pairingCode: auth.pairingCode, module: { name: "Stored impact", preset: "impactBurst", element: "electric", seed: 7 } }) });
+    const generated = await generatedResponse.json() as any;
+    assert.equal(generated.status, "succeeded");
+    assert.ok(generated.draftId);
+    assert.equal(generated.draft, undefined, "large node arrays stay in the relay");
+    const stagedResponse = await fetch(`http://127.0.0.1:${draftPort}/v1/vfx/stage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pairingCode: auth.pairingCode, transactionName: "Stored", draftId: generated.draftId, confirmWrite: true }) });
+    assert.equal(stagedResponse.status, 202);
+    const pollResponse = await fetch(`http://127.0.0.1:${draftPort}/v1/plugin/poll`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(auth) });
+    const poll = await pollResponse.json() as any;
+    assert.equal(poll.command.method, "vfx.stageDraft");
+    assert.ok(poll.command.params.draft.nodes.length >= 3);
   } finally {
     await relay.stop();
   }
