@@ -332,7 +332,23 @@ export function createPairingCode(seed?: string) {
 }
 
 function privacyPolicy() {
-  return `Visual Director Privacy Policy\n\nVisual Director relays declarative VFX drafts between an authorized AI client and the Roblox Studio plugin identified by a pairing code. It does not request Roblox passwords or API keys. Drafts and command results are kept in memory for active jobs and are not sold. The service may process Roblox user ID, place ID, place name, plugin version and installation identifiers solely to route authorized commands. Remove the plugin or stop the relay to end the connection.`;
+  return `Visual Director Privacy Policy
+
+Visual Director relays declarative VFX requests between an authorized AI client and the Roblox Studio plugin identified by a personal pairing code.
+
+Data processed: pairing codes, Roblox user ID, place ID and name, plugin and installation identifiers, selected-scene metadata, VFX drafts, command results, and operational timestamps.
+
+Purpose: route requested VFX operations, return results, prevent abuse, diagnose failures, and maintain the active Studio connection.
+
+Retention: pairing sessions, drafts, and command jobs are temporary runtime data and expire or are removed when no longer required by the running service. Reusable modules intentionally saved by a user remain in that user's Studio/plugin environment until removed there.
+
+Sharing: Visual Director does not sell personal data and does not intentionally publish pairing codes, place data, private drafts, or command results.
+
+User control: closing Studio, disabling remote mode, or removing the plugin ends availability of that Studio session. Users can discard staged work and remove attached packages in Studio.
+
+Security: the relay exposes a fixed allowlist of declarative VFX operations and does not accept arbitrary Luau or Roblox passwords. Pairing codes should be treated as secrets while the plugin is online.
+
+Contact and deletion requests: https://github.com/luizguilhermevalentinecreis-ai/Visual-Director/issues`;
 }
 
 function openApiDocument(baseUrl: string) {

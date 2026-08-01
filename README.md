@@ -25,6 +25,8 @@ The AI never sends executable Luau. It can author a declarative `VfxDraft`, capt
 - `src/index.ts` — local MCP server.
 - `studio-plugin/VisualDirectorPlugin.server.lua` — Roblox Studio plugin.
 - `gpt-custom/INSTRUCTIONS.md` — Custom GPT behavior.
+- `gpt-custom/KNOWLEDGE.md` — reference file uploaded to GPT Knowledge.
+- `gpt-custom/CONFIG.md` — exact GPT editor fields and smoke tests.
 - `docs/CHATGPT_CUSTOM_GPT.md` — setup guide.
 
 ## Local development
@@ -51,11 +53,11 @@ In the plugin, use `http://127.0.0.1:34728` when connecting directly to the loca
 
 The included `render.yaml` and `Dockerfile` are ready for Render. After deployment:
 
-1. Open `https://YOUR-SERVICE.onrender.com/health`.
-2. Set that URL in the Visual Director plugin and click Connect.
+1. Open `https://visual-director-relay.onrender.com/health`.
+2. Set `https://visual-director-relay.onrender.com` in the Visual Director plugin and click Connect.
 3. Copy the permanent pairing code.
-4. Import `https://YOUR-SERVICE.onrender.com/openapi.json` into a Custom GPT Action.
-5. Use `https://YOUR-SERVICE.onrender.com/privacy` as the privacy-policy URL.
+4. Import `https://visual-director-relay.onrender.com/openapi.json` into a Custom GPT Action.
+5. Use `https://visual-director-relay.onrender.com/privacy` as the privacy-policy URL.
 
 No OpenAI or Roblox API key is required for pairing. The random plugin token authenticates the current Studio launch; the visible pairing code remains stable for that Studio user until plugin settings are cleared.
 
