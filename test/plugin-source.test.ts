@@ -12,4 +12,9 @@ test("Studio plugin exposes every relay action and never accepts arbitrary code"
   assert.match(source, /publishPackageMarkers\(package, destinationName\)/);
   assert.match(source, /VisualDirectorPairingCodeV1/);
   assert.match(source, /for _, item in ipairs\(nodeRoot:GetDescendants\(\)\)/, "static preview must apply anchor timing to nested native effects");
+  assert.match(source, /emitter\.Enabled = false/, "committed emitters must remain dormant until timeline playback");
+  assert.match(source, /beam\.Enabled = false/);
+  assert.match(source, /light\.Enabled = false/);
+  assert.match(source, /editPreviewLooping = not RunService:IsRunning\(\)/, "Edit mode attachments should preview in a controlled loop");
+  assert.match(source, /clearParticlesOnLoop = not authoredLoop/);
 });

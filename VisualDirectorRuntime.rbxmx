@@ -5,9 +5,8 @@
       <string name="Source"><![CDATA[--!strict
 -- Visual Director runtime playback.
 --
--- A committed package only stores its timeline as attributes: the plugin never
--- animates anything, so a package sitting in the workspace shows every node at
--- once, frozen. This module is the missing consumer. It walks a package, reads
+-- A committed package stores its timeline as attributes and keeps native
+-- effects dormant until this module drives them. It walks a package, reads
 -- the authored StartTime/EndTime/StartScale/EndScale/Easing attributes, and
 -- drives them over real time.
 --
@@ -29,6 +28,9 @@ local Runtime = {}
 export type PlayOptions = {
 	speed: number?,
 	loop: boolean?,
+	-- One-shot effects previewed repeatedly should not accumulate particles from
+	-- the previous cycle. Seamless authored loops can leave this false.
+	clearParticlesOnLoop: boolean?,
 	-- Camera shake and post effects are client-only and are skipped on the
 	-- server rather than erroring, so the same call works in both contexts.
 	applyCameraEffects: boolean?,
@@ -400,8 +402,8 @@ function Runtime.play(root: Instance, options: PlayOptions?): Playback
 		duration = math.max(duration, declared)
 	end
 
-	-- Start from a clean slate: the plugin leaves every emitter enabled, so
-	-- without this the first frame shows the whole effect at once.
+	-- Start from a clean slate even for captured third-party packages whose
+	-- native instances may have been enabled before Visual Director owned them.
 	for _, node in ipairs(nodes) do
 		node.active = true
 		setActive(node, false)
@@ -456,6 +458,23 @@ function Runtime.play(root: Instance, options: PlayOptions?): Playback
 		elapsed += delta * speed
 		if elapsed >= duration then
 			if settings.loop then
+				-- Force a real timeline boundary. Otherwise a node spanning the end
+				-- and beginning remains active and its burst never fires again.
+				for _, node in ipairs(nodes) do
+					local resetNode = settings.clearParticlesOnLoop == true
+					if not resetNode then
+						for _, emitter in ipairs(node.emitters) do
+							local burst = emitter:GetAttribute("BurstCount")
+							if type(burst) == "number" and burst > 0 then resetNode = true; break end
+						end
+					end
+					if resetNode then
+						setActive(node, false)
+						if settings.clearParticlesOnLoop == true then
+							for _, emitter in ipairs(node.emitters) do emitter:Clear() end
+						end
+					end
+				end
 				elapsed = elapsed % duration
 			else
 				applyAt(duration)

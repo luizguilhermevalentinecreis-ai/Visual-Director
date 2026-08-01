@@ -3,6 +3,7 @@ local Selection = game:GetService("Selection")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local RunService = game:GetService("RunService")
 local VisualDirectorRuntime = require(script.Parent:WaitForChild("VisualDirectorRuntime"))
 
 -- 0.1.2 adds particle emitter shape support (Shape/ShapeStyle/ShapeInOut/
@@ -41,6 +42,7 @@ local sessionId = nil
 local connected = false
 local running = true
 local activeTimelinePlayback = nil
+local activeAttachedPlaybacks = {}
 -- Reconnection is intent-driven. The plugin never reaches out to a relay on
 -- its own: it only starts retrying once the user has explicitly connected at
 -- least once. After that, a dropped session (the local bridge restarting
@@ -318,7 +320,9 @@ local function createParticle(node, parent)
     pcall(function() emitter.FlipbookMode = flipbookModes[node.flipbookMode or "loop"] or Enum.ParticleFlipbookMode.Loop end)
     pcall(function() emitter.FlipbookFramerate = numberRange(node.flipbookFramerate, 1) end)
     pcall(function() emitter.FlipbookStartRandom = node.flipbookStartRandom == true end)
-    emitter.Enabled = (node.rate or 0) > 0
+    -- Templates and attachments stay dormant until the timeline runtime enters
+    -- this node's authored StartTime/EndTime window.
+    emitter.Enabled = false
     emitter:SetAttribute("BurstCount", node.burstCount or 0)
     emitter.Parent = attachment
 end
@@ -350,6 +354,7 @@ local function createBeam(node, parent)
     beam.LightInfluence = node.lightInfluence == nil and 1 or node.lightInfluence
     pcall(function() beam.TextureMode = textureModes[node.textureMode or "stretch"] or Enum.TextureMode.Stretch end)
     pcall(function() beam.Brightness = node.brightness or 1 end)
+    beam.Enabled = false
     beam.Parent = p0
 end
 
@@ -385,7 +390,7 @@ local function createGeometry(node, parent)
     part.Size = vector3(node.size, Vector3.one)
     part.Color = color(node.color)
     part.Material = Enum.Material[node.material or "Neon"] or Enum.Material.Neon
-    part.Transparency = node.transparency or 0
+    part.Transparency = 1
     if part:IsA("Part") then
         if node.shape == "ball" then part.Shape = Enum.PartType.Ball end
         if node.shape == "cylinder" or node.shape == "ring" then part.Shape = Enum.PartType.Cylinder end
@@ -413,6 +418,7 @@ local function createLight(node, parent)
     light.Range = node.range or 16
     light.Shadows = node.shadows == true
     if light:IsA("SpotLight") then light.Angle = node.angle or 90 end
+    light.Enabled = false
     light.Parent = part
 end
 
@@ -437,6 +443,7 @@ local function createScreen(node, parent)
     layer.BackgroundTransparency = node.transparency or 0
     layer.BorderSizePixel = 0
     layer.ZIndex = node.zIndex or 1
+    layer.Visible = false
     layer:SetAttribute("StartScale", node.startScale or 1)
     layer:SetAttribute("EndScale", node.endScale or 1)
     layer:SetAttribute("StartTransparency", node.startTransparency or 0)
@@ -1207,12 +1214,32 @@ handlers["vfx.attachCommitted"] = function(params)
     end
     local clone = source:Clone()
     local old = destination:FindFirstChild(source.Name)
-    if old then old:Destroy() end
+    if old then
+        local oldPlayback = activeAttachedPlaybacks[old]
+        if oldPlayback then pcall(function() oldPlayback:stop() end); activeAttachedPlaybacks[old] = nil end
+        old:Destroy()
+    end
     clone:SetAttribute("AttachedTarget", target:GetFullName())
     clone.Parent = destination
     placeCloneAtTarget(clone, target)
+    local editPreviewLooping = not RunService:IsRunning()
+    if editPreviewLooping then
+        local authoredLoop = source:GetAttribute("Looped") == true
+        local playback = VisualDirectorRuntime.play(clone, {
+            speed = 1,
+            loop = true,
+            clearParticlesOnLoop = not authoredLoop,
+            applyCameraEffects = false,
+        })
+        activeAttachedPlaybacks[clone] = playback
+        playback.finished:Connect(function() activeAttachedPlaybacks[clone] = nil end)
+        clone.Destroying:Connect(function()
+            local current = activeAttachedPlaybacks[clone]
+            if current then pcall(function() current:stop() end); activeAttachedPlaybacks[clone] = nil end
+        end)
+    end
     ChangeHistoryService:SetWaypoint("Attach Visual Director package " .. source.Name)
-    return { status = "attached", packageName = source.Name, target = target:GetFullName(), path = clone:GetFullName() }
+    return { status = "attached", packageName = source.Name, target = target:GetFullName(), path = clone:GetFullName(), editPreviewLooping = editPreviewLooping }
 end
 
 local function setPreviewState(root, time)
@@ -1451,4 +1478,8 @@ end)
 plugin.Unloading:Connect(function()
     running = false
     if activeTimelinePlayback then pcall(function() activeTimelinePlayback:stop() end) end
+    for clone, playback in activeAttachedPlaybacks do
+        pcall(function() playback:stop() end)
+        activeAttachedPlaybacks[clone] = nil
+    end
 end)
